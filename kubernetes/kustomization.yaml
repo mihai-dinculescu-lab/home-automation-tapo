@@ -4,9 +4,11 @@ resources:
 
 namespace: default
 
-commonLabels:
-  app.kubernetes.io/part-of: home-automation
-  app.kubernetes.io/name: tapo
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: home-automation
+      app.kubernetes.io/name: tapo
+    includeSelectors: true
 
 images:
   - name: ghcr.io/mihai-dinculescu-lab/home-automation-tapo
