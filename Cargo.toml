@@ -21,7 +21,7 @@ paho-mqtt = "0.14"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tapo = "0.8"
-tokio = { version = "1.51", features = ["rt-multi-thread", "macros", "signal"] }
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "signal"] }
 tracing = { version = "0.1", features = ["attributes"] }
 tracing-actix = "0.4"
 tracing-actix-web = "0.7"
