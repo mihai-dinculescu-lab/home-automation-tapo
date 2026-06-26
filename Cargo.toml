@@ -14,7 +14,7 @@ derive_more = { version = "2.1", features = ["display"] }
 opentelemetry = "0.31"
 opentelemetry_sdk = "0.31"
 opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }
-opentelemetry-semantic-conventions = { version = "0.31", features = [
+opentelemetry-semantic-conventions = { version = "0.32", features = [
     "semconv_experimental",
 ] }
 paho-mqtt = "0.14"
