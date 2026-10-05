@@ -5,6 +5,7 @@ use tapo::ApiClient;
 use tracing::instrument;
 
 use crate::settings::Tapo;
+use crate::system::api::device_type::{DeviceHandler, DeviceState, DeviceType};
 use crate::system::api::errors::ApiError;
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,18 +26,20 @@ impl ApiStatusResponse {
 #[derive(Deserialize)]
 pub struct SetDevicePayload {
     ip_address: String,
-    device_on: bool,
+    device_type: DeviceType,
+    state: DeviceState,
 }
 
 #[derive(Deserialize)]
 pub struct GetDevicePayload {
     ip_address: String,
+    device_type: DeviceType,
 }
 
 #[derive(Serialize)]
 pub struct DeviceResponse {
     ip_address: String,
-    device_on: Option<bool>,
+    state: DeviceState,
 }
 
 #[instrument(name = "health_check", skip_all)]
@@ -48,25 +51,25 @@ pub async fn health_check() -> HttpResponse {
 
 #[instrument(name = "get_device", skip_all, fields(
     device.ip_address = %device.ip_address,
+    device.device_type = ?device.device_type,
 ))]
 pub async fn get_device(
     config: web::Data<Tapo>,
     device: web::Json<GetDevicePayload>,
 ) -> Result<HttpResponse, ApiError> {
     let client = ApiClient::new(config.username.clone(), config.password.clone());
-    let handler = client
-        .generic_device(device.ip_address.clone())
+    let handler = DeviceHandler::new(client, device.device_type, device.ip_address.clone())
         .await
         .map_err(|_| ApiError::BadRequest("failed to connect to the device".to_string()))?;
 
-    let device_info = handler
-        .get_device_info()
+    let state = handler
+        .state()
         .await
         .map_err(|_| ApiError::InternalServerError)?;
 
     let result = DeviceResponse {
         ip_address: device.ip_address.clone(),
-        device_on: device_info.device_on,
+        state,
     };
 
     Ok(HttpResponse::Ok().json(result))
@@ -74,33 +77,28 @@ pub async fn get_device(
 
 #[instrument(name = "set_device", skip_all, fields(
     device.ip_address = %device.ip_address,
-    device.device_on = %device.device_on,
+    device.device_type = ?device.device_type,
+    device.state.on = ?device.state.on,
 ))]
 pub async fn set_device(
     config: web::Data<Tapo>,
     device: web::Json<SetDevicePayload>,
 ) -> Result<HttpResponse, ApiError> {
     let client = ApiClient::new(config.username.clone(), config.password.clone());
-    let handler = client
-        .generic_device(device.ip_address.clone())
+    let handler = DeviceHandler::new(client, device.device_type, device.ip_address.clone())
         .await
         .map_err(|_| ApiError::BadRequest("failed to connect to the device".to_string()))?;
 
-    if device.device_on {
-        handler
-            .on()
-            .await
-            .map_err(|_| ApiError::InternalServerError)?
-    } else {
-        handler
-            .off()
-            .await
-            .map_err(|_| ApiError::InternalServerError)?
+    match device.state.on {
+        Some(true) => handler.on().await,
+        Some(false) => handler.off().await,
+        None => Ok(()),
     }
+    .map_err(|_| ApiError::InternalServerError)?;
 
     let result = DeviceResponse {
         ip_address: device.ip_address.clone(),
-        device_on: Some(device.device_on),
+        state: device.state,
     };
 
     Ok(HttpResponse::Ok().json(result))
