@@ -31,7 +31,7 @@ docker run -d -p 80:80 home-automation-tapo
 ```
 
 
-[ci_badge]: https://github.com/mihai-dinculescu/home-automation-tapo/workflows/CI/badge.svg?branch=main
-[ci]: https://github.com/mihai-dinculescu/home-automation-tapo/actions
-[license_badge]: https://img.shields.io/github/license/mihai-dinculescu/home-automation-tapo
-[license]: https://github.com/mihai-dinculescu/home-automation-tapo/blob/main/LICENSE
+[ci_badge]: https://github.com/mihai-dinculescu-lab/home-automation-tapo/actions/workflows/ci.yml/badge.svg?branch=main
+[ci]: https://github.com/mihai-dinculescu-lab/home-automation-tapo/actions
+[license_badge]: https://img.shields.io/github/license/mihai-dinculescu-lab/home-automation-tapo
+[license]: https://github.com/mihai-dinculescu-lab/home-automation-tapo/blob/main/LICENSE
