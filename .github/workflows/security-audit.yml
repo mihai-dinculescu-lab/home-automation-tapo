@@ -14,6 +14,11 @@ on:
       - "**/Cargo.lock"
   schedule:
     - cron: "0 1 * * *"
+permissions:
+  contents: read
+  checks: write
+  issues: write
+
 jobs:
   security_audit:
     name: Audit
@@ -21,6 +26,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions-rs/audit-check@v1
+      - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
