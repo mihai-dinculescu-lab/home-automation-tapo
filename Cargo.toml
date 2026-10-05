@@ -6,8 +6,8 @@ license = "MIT"
 
 [dependencies]
 actix = "0.13"
-actix-rt = "2.11"
-actix-web = "4.13"
+actix-rt = "2.15"
+actix-web = "4.15"
 anyhow = "1.0"
 config = { version = "0.15", default-features = false, features = ["yaml"] }
 derive_more = { version = "2.1", features = ["display"] }
@@ -21,7 +21,7 @@ paho-mqtt = "0.14"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tapo = "0.8"
-tokio = { version = "1.51", features = ["rt-multi-thread", "macros", "signal"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal"] }
 tracing = { version = "0.1", features = ["attributes"] }
 tracing-actix = "0.4"
 tracing-actix-web = "0.7"
