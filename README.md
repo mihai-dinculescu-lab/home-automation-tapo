@@ -15,19 +15,54 @@ Actor System consisting of:
 
 ## Usage
 
+Building requires [CMake](https://cmake.org/) and OpenSSL, which are needed by the MQTT client.
+
 Rename and update `settings.sample.yaml` to `settings.yaml`.
 
 ```bash
 cargo run
 ```
 
+## API
+
+The API listens on the `api.host` and `api.port` from `settings.yaml`.
+
+| Method | Path            | JSON body                                              | Description                       |
+| ------ | --------------- | ------------------------------------------------------ | --------------------------------- |
+| `GET`  | `/health-check` |                                                        | Returns `200 OK` if the API is up |
+| `GET`  | `/device`       | `{ "ip_address": "192.168.1.100" }`                    | Returns whether the device is on  |
+| `POST` | `/device`       | `{ "ip_address": "192.168.1.100", "device_on": true }` | Turns the device on or off        |
+
+## Telemetry
+
+Logs are written to stdout. Traces are exported through OTLP (gRPC) when `telemetry.otlp_endpoint` is set in `settings.yaml`.
+
 ## Docker
 
 ### linux/amd64 & linux/arm64
 
+The image does not include a usable `settings.yaml`, so one has to be mounted at `/app/settings.yaml`.
+The published port has to match the `api.port` from `settings.yaml`.
+
+A prebuilt image is published to the GitHub Container Registry.
+
+```bash
+docker run -d -p 80:80 -v ./settings.yaml:/app/settings.yaml ghcr.io/mihai-dinculescu-lab/home-automation-tapo:main
+```
+
+Alternatively, build it locally.
+
 ```bash
 docker build -t home-automation-tapo .
-docker run -d -p 80:80 home-automation-tapo
+docker run -d -p 80:80 -v ./settings.yaml:/app/settings.yaml home-automation-tapo
+```
+
+## Kubernetes
+
+The manifests in `kubernetes/` are applied by CI on every push to `main`.
+
+```bash
+kubectl apply -k kubernetes/
 ```
 
 
