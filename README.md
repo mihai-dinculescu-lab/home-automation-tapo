@@ -3,7 +3,7 @@
 [![CI][ci_badge]][ci]
 [![license][license_badge]][license]
 
-Reads the `device_usage` of multiple devices and sends the data through MQTT to be picked up by [home-automation-monitoring](https://github.com/mihai-dinculescu/home-automation-monitoring).
+Reads the `device_usage` of multiple devices and sends the data through MQTT.
 It also includes an API that can control the devices.
 
 Actor System consisting of:
