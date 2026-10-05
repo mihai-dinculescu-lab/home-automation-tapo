@@ -11,10 +11,10 @@ actix-web = "4.15"
 anyhow = "1.0"
 config = { version = "0.15", default-features = false, features = ["yaml"] }
 derive_more = { version = "2.1", features = ["display"] }
-opentelemetry = "0.31"
-opentelemetry_sdk = "0.31"
-opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }
-opentelemetry-semantic-conventions = { version = "0.31", features = [
+opentelemetry = "0.33"
+opentelemetry_sdk = "0.33"
+opentelemetry-otlp = { version = "0.33", features = ["grpc-tonic"] }
+opentelemetry-semantic-conventions = { version = "0.33", features = [
     "semconv_experimental",
 ] }
 paho-mqtt = "0.14"
@@ -25,7 +25,7 @@ tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal"] }
 tracing = { version = "0.1", features = ["attributes"] }
 tracing-actix = "0.4"
 tracing-actix-web = "0.7"
-tracing-opentelemetry = "0.32"
+tracing-opentelemetry = "0.34"
 tracing-subscriber = { version = "0.3", features = [
     "env-filter",
     "fmt",
