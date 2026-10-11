@@ -10,11 +10,11 @@ use tracing::{Level, Span};
 use tracing_subscriber::Registry;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt as _};
 
-pub fn record_error(span: &Span, e: &impl Error) {
+pub fn record_error<E: Error>(span: &Span, e: &E) {
     span.record(semconv::attribute::OTEL_STATUS_CODE, "ERROR");
     span.record(
         semconv::attribute::EXCEPTION_TYPE,
-        "SendError<DeviceUsageMessage>",
+        std::any::type_name::<E>(),
     );
     span.record(semconv::attribute::EXCEPTION_MESSAGE, e.to_string());
     span.record(semconv::attribute::EXCEPTION_STACKTRACE, format!("{e:?}"));

@@ -39,7 +39,7 @@ impl CoordinatorActor {
 
         let mqtt_actor = MqttActor::new(settings.mqtt.clone())
             .inspect_err(|e| {
-                record_error(&span, &e);
+                record_error(&span, e);
             })
             .context("Failed to create the MQTT actor")?;
         let mqtt_actor_addr = mqtt_actor.start();

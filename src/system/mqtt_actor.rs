@@ -27,7 +27,7 @@ impl MqttActor {
         let span = tracing::Span::current();
 
         let client = AsyncClient::new(config.address.clone()).inspect_err(|e| {
-            record_error(&span, &e);
+            record_error(&span, e);
         })?;
 
         Ok(Self { config, client })
