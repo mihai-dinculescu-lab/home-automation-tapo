@@ -14,7 +14,7 @@ spec:
           imagePullPolicy: Always
           env:
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
-              value: "http://grafana-k8s-monitoring-alloy-receiver.grafana-alloy.svc.cluster.local:4318"
+              value: "http://alloy.monitoring:4318"
             - name: OTEL_RESOURCE_ATTRIBUTES
               value: "service.namespace=home-automation,deployment.environment.name=production"
           volumeMounts:
