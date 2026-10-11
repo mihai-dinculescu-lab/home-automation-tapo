@@ -18,6 +18,10 @@ pub struct GetDeviceDataMessage {
 
 #[derive(Debug, Message)]
 #[rtype(result = "()")]
+pub struct StopMessage;
+
+#[derive(Debug, Message)]
+#[rtype(result = "()")]
 pub struct DeviceUsageMessage {
     pub span_context: opentelemetry::Context,
     pub device: Device,

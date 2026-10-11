@@ -30,7 +30,7 @@ FROM debian:trixie-slim AS runtime
 
 RUN apt-get update && \
     apt-get -y upgrade && \
-    apt-get -y install openssl
+    apt-get -y install openssl ca-certificates
 
 WORKDIR /app
 COPY --from=builder /app/target/release/home-automation-tapo home-automation-tapo

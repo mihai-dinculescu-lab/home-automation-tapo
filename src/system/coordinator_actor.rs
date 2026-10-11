@@ -1,8 +1,12 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use actix::clock::interval;
-use actix::{Actor, Addr, AsyncContext, Context, Handler, WrapFuture};
+use actix::clock::{interval, sleep};
+use actix::dev::ToEnvelope;
+use actix::{
+    Actor, ActorContext, ActorFutureExt, Addr, AsyncContext, Context, Handler, ResponseActFuture,
+    WrapFuture,
+};
 use anyhow::Context as _;
 use tracing::{info, instrument, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -10,7 +14,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::settings::Settings;
 use crate::system::api::api_actor::ApiActor;
 use crate::system::device_actor::DeviceActor;
-use crate::system::messages::{DeviceUsageMessage, HealthCheckMessage};
+use crate::system::messages::{DeviceUsageMessage, HealthCheckMessage, StopMessage};
 use crate::system::mqtt_actor::MqttActor;
 use crate::telemetry::record_error;
 
@@ -20,6 +24,7 @@ pub struct CoordinatorActor {
     api_actor_addr: Addr<ApiActor>,
     mqtt_actor_addr: Addr<MqttActor>,
     device_actors: HashMap<String, Addr<DeviceActor>>,
+    shutting_down: bool,
 }
 
 impl CoordinatorActor {
@@ -47,7 +52,13 @@ impl CoordinatorActor {
             api_actor_addr,
             mqtt_actor_addr,
             device_actors: HashMap::new(),
+            shutting_down: false,
         })
+    }
+
+    /// Stops the coordinator and all of its child actors, returning once they have all stopped.
+    pub async fn stop(addr: Addr<Self>) {
+        stop_actor(addr).await;
     }
 }
 
@@ -111,6 +122,11 @@ impl Handler<HealthCheckMessage> for CoordinatorActor {
     fn handle(&mut self, message: HealthCheckMessage, ctx: &mut Context<Self>) -> Self::Result {
         let _ = tracing::Span::current().set_parent(message.span_context);
 
+        // don't restart the actors that are being stopped
+        if self.shutting_down {
+            return;
+        }
+
         // check api
         if !self.api_actor_addr.connected() {
             warn!("API Actor is not connected, restarting...");
@@ -161,6 +177,46 @@ impl Handler<HealthCheckMessage> for CoordinatorActor {
             self.device_actors
                 .insert(device.ip_address.clone(), device_actor_addr);
         }
+    }
+}
+
+impl Handler<StopMessage> for CoordinatorActor {
+    type Result = ResponseActFuture<Self, ()>;
+
+    #[instrument(name = "CoordinatorActor::Handler<StopMessage>", skip_all)]
+    fn handle(&mut self, _: StopMessage, _: &mut Context<Self>) -> Self::Result {
+        self.shutting_down = true;
+
+        let device_actors: Vec<_> = self.device_actors.drain().map(|(_, addr)| addr).collect();
+        let api_actor_addr = self.api_actor_addr.clone();
+        let mqtt_actor_addr = self.mqtt_actor_addr.clone();
+
+        // MQTT goes last so that usage already queued by the device actors can still be published.
+        Box::pin(
+            async move {
+                for device_actor in device_actors {
+                    stop_actor(device_actor).await;
+                }
+                stop_actor(api_actor_addr).await;
+                stop_actor(mqtt_actor_addr).await;
+            }
+            .into_actor(self)
+            .map(|_, _, ctx| ctx.stop()),
+        )
+    }
+}
+
+/// Sends `StopMessage` and waits until the actor's mailbox is gone, i.e. `stopped()` has run.
+async fn stop_actor<A>(addr: Addr<A>)
+where
+    A: Actor + Handler<StopMessage>,
+    A::Context: ToEnvelope<A, StopMessage>,
+{
+    // an error means the actor has already stopped
+    let _ = addr.send(StopMessage).await;
+
+    while addr.connected() {
+        sleep(Duration::from_millis(10)).await;
     }
 }
 

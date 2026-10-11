@@ -13,7 +13,12 @@ config = { version = "0.15", default-features = false, features = ["yaml"] }
 derive_more = { version = "2.1", features = ["display"] }
 opentelemetry = "0.33"
 opentelemetry_sdk = "0.33"
-opentelemetry-otlp = { version = "0.33", features = ["grpc-tonic"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = [
+    "trace",
+    "http-proto",
+    "reqwest-blocking-client",
+    "reqwest-rustls",
+] }
 opentelemetry-semantic-conventions = { version = "0.33", features = [
     "semconv_experimental",
 ] }

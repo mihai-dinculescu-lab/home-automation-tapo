@@ -12,6 +12,11 @@ spec:
         - name: tapo
           image: ghcr.io/mihai-dinculescu-lab/home-automation-tapo
           imagePullPolicy: Always
+          env:
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://grafana-k8s-monitoring-alloy-receiver.grafana-alloy.svc.cluster.local:4318"
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "service.namespace=home-automation,deployment.environment.name=production"
           volumeMounts:
             - name: tapo-config
               mountPath: /app/settings.yaml

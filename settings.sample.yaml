@@ -1,8 +1,3 @@
-telemetry:
-  service_name:
-  service_namespace:
-  deployment_environment:
-  otlp_endpoint:
 api:
   host:
   port:

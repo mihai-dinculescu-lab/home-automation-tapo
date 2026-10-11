@@ -1,4 +1,4 @@
-use actix::{Actor, AsyncContext, Context, Handler, WrapFuture};
+use actix::{Actor, ActorContext, AsyncContext, Context, Handler, WrapFuture};
 use paho_mqtt::{AsyncClient, Message, QOS_1};
 use serde_json::json;
 use tapo::responses::DeviceUsageEnergyMonitoringResult;
@@ -7,7 +7,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::{
     settings::{Device, Mqtt},
-    system::messages::{DeviceUsageMessage, MqttMessagePayload},
+    system::messages::{DeviceUsageMessage, MqttMessagePayload, StopMessage},
     telemetry::record_error,
 };
 
@@ -72,6 +72,14 @@ impl Actor for MqttActor {
 
     #[instrument(name = "MqttActor::stopped", level = "error", skip_all)]
     fn stopped(&mut self, _: &mut Self::Context) {}
+}
+
+impl Handler<StopMessage> for MqttActor {
+    type Result = ();
+
+    fn handle(&mut self, _: StopMessage, ctx: &mut Context<Self>) -> Self::Result {
+        ctx.stop();
+    }
 }
 
 impl Handler<DeviceUsageMessage> for MqttActor {

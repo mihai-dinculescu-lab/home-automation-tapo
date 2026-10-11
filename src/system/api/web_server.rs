@@ -1,6 +1,10 @@
 use std::net::TcpListener;
 
-use actix_web::{App, HttpServer, dev::Server, web};
+use actix_web::{
+    App, HttpServer,
+    dev::{Server, ServerHandle},
+    web,
+};
 use anyhow::Context;
 use tracing_actix_web::TracingLogger;
 
@@ -28,6 +32,9 @@ impl WebServer {
                 .route("/device", web::get().to(handlers::get_device))
                 .route("/device", web::post().to(handlers::set_device))
         })
+        // The process-level shutdown (main.rs) stops the server via its handle.
+        .disable_signals()
+        .shutdown_timeout(5)
         .listen(listener)
         .context("failed to listen to the API socket")?
         .run();
@@ -41,5 +48,9 @@ impl WebServer {
 
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    pub fn handle(&self) -> ServerHandle {
+        self.server.handle()
     }
 }

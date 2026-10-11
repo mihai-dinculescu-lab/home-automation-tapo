@@ -1,13 +1,15 @@
 use std::time::Duration;
 
-use actix::{Actor, Addr, AsyncContext, Context, Handler, WrapFuture, clock::interval};
+use actix::{
+    Actor, ActorContext, Addr, AsyncContext, Context, Handler, WrapFuture, clock::interval,
+};
 use tapo::ApiClient;
 use tracing::{Instrument, error, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::{
     settings::{Device, Tapo},
-    system::messages::{DeviceUsageMessage, GetDeviceDataMessage},
+    system::messages::{DeviceUsageMessage, GetDeviceDataMessage, StopMessage},
     telemetry::record_error,
 };
 
@@ -130,6 +132,14 @@ impl Actor for DeviceActor {
         device.ip_address = %self.device.ip_address,
     ))]
     fn stopped(&mut self, _: &mut Self::Context) {}
+}
+
+impl Handler<StopMessage> for DeviceActor {
+    type Result = ();
+
+    fn handle(&mut self, _: StopMessage, ctx: &mut Context<Self>) -> Self::Result {
+        ctx.stop();
+    }
 }
 
 impl Handler<GetDeviceDataMessage> for DeviceActor {

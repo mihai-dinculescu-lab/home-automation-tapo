@@ -48,7 +48,10 @@ Both `/device` endpoints respond with `{ "ip_address": "192.168.1.100", "state":
 
 ## Telemetry
 
-Logs are written to stdout. Traces are exported through OTLP (gRPC) when `telemetry.otlp_endpoint` is set in `settings.yaml`.
+Logs are written to stdout. Traces are exported through OTLP over HTTP/protobuf when `OTEL_EXPORTER_OTLP_ENDPOINT` (e.g. `http://localhost:4318`) or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is set.
+The standard `OTEL_*` environment variables are honoured. `service.name` defaults to `home-automation-tapo`.
+Only HTTP/protobuf is supported, so point the endpoint at the collector's OTLP HTTP port (usually `4318`), not the gRPC one (`4317`). `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` is not honoured.
+Extra resource attributes can be set through `OTEL_RESOURCE_ATTRIBUTES`, e.g. `service.namespace=home-automation,deployment.environment.name=production`.
 
 ## Docker
 
