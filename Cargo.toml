@@ -7,7 +7,7 @@ license = "MIT"
 [dependencies]
 actix = "0.13"
 actix-rt = "2.15"
-actix-web = { version = "4.17", default-features = false }
+actix-web = { version = "4.18", default-features = false }
 anyhow = "1.0"
 config = { version = "0.15", default-features = false, features = ["yaml"] }
 derive_more = { version = "2.1", features = ["display"] }
@@ -25,7 +25,7 @@ opentelemetry-semantic-conventions = { version = "0.33", features = [
 paho-mqtt = "0.14"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tapo = "0.11"
+tapo = "0.12"
 tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "signal"] }
 tracing = { version = "0.1", features = ["attributes"] }
 tracing-actix = "0.4"
