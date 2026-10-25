@@ -1270,7 +1270,6 @@ dependencies = [
  "tapo",
  "tokio",
  "tracing",
- "tracing-actix",
  "tracing-actix-web",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -3352,18 +3351,6 @@ dependencies = [
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
-]
-
-[[package]]
-name = "tracing-actix"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c817336e87c6e0c86d1fc220be24ebfb18ad3f3a14d80c0ca8bdba9f3ea261e7"
-dependencies = [
- "actix",
- "futures",
- "pin-project-lite",
- "tracing",
 ]
 
 [[package]]

@@ -2,11 +2,12 @@ use actix_web::http::StatusCode;
 use actix_web::{HttpResponse, web};
 use serde::{Deserialize, Serialize};
 use tapo::ApiClient;
-use tracing::instrument;
+use tracing::{instrument, warn};
 
 use crate::settings::Tapo;
 use crate::system::api::device_type::{DeviceHandler, DeviceState, DeviceType};
 use crate::system::api::errors::ApiError;
+use crate::telemetry::record_error;
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiStatusResponse {
@@ -60,12 +61,16 @@ pub async fn get_device(
     let client = ApiClient::new(config.username.clone(), config.password.clone());
     let handler = DeviceHandler::new(client, device.device_type, device.ip_address.clone())
         .await
-        .map_err(|_| ApiError::BadRequest("failed to connect to the device".to_string()))?;
+        .map_err(|e| {
+            // a client error, so the request span isn't marked as failed
+            warn!(error = %e, "Failed to connect to the device");
+            ApiError::BadRequest("failed to connect to the device".to_string())
+        })?;
 
-    let state = handler
-        .state()
-        .await
-        .map_err(|_| ApiError::InternalServerError)?;
+    let state = handler.state().await.map_err(|e| {
+        record_error!(&e);
+        ApiError::InternalServerError
+    })?;
 
     let result = DeviceResponse {
         ip_address: device.ip_address.clone(),
@@ -87,14 +92,21 @@ pub async fn set_device(
     let client = ApiClient::new(config.username.clone(), config.password.clone());
     let handler = DeviceHandler::new(client, device.device_type, device.ip_address.clone())
         .await
-        .map_err(|_| ApiError::BadRequest("failed to connect to the device".to_string()))?;
+        .map_err(|e| {
+            // a client error, so the request span isn't marked as failed
+            warn!(error = %e, "Failed to connect to the device");
+            ApiError::BadRequest("failed to connect to the device".to_string())
+        })?;
 
     match device.state.on {
         Some(true) => handler.on().await,
         Some(false) => handler.off().await,
         None => Ok(()),
     }
-    .map_err(|_| ApiError::InternalServerError)?;
+    .map_err(|e| {
+        record_error!(&e);
+        ApiError::InternalServerError
+    })?;
 
     let result = DeviceResponse {
         ip_address: device.ip_address.clone(),

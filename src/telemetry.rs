@@ -7,18 +7,148 @@ use opentelemetry_otlp::SpanExporter;
 use opentelemetry_sdk::{Resource, propagation::TraceContextPropagator, trace::SdkTracerProvider};
 use opentelemetry_semantic_conventions as semconv;
 use tracing::{Level, Span};
+use tracing_opentelemetry::{OpenTelemetrySpanExt as _, SetParentError};
 use tracing_subscriber::Registry;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt as _};
 
-pub fn record_error<E: Error>(span: &Span, e: &E) {
-    span.record(semconv::attribute::OTEL_STATUS_CODE, "ERROR");
-    span.record(
-        semconv::attribute::EXCEPTION_TYPE,
-        std::any::type_name::<E>(),
-    );
-    span.record(semconv::attribute::EXCEPTION_MESSAGE, e.to_string());
-    span.record(semconv::attribute::EXCEPTION_STACKTRACE, format!("{e:?}"));
+/// Parents `span` to the OpenTelemetry context carried by a message.
+///
+/// Must be called before the span is entered: entering builds the OpenTelemetry span, after
+/// which its parent can no longer be changed and `set_parent` fails with `AlreadyStarted`.
+pub fn set_parent_context(span: &Span, cx: opentelemetry::Context) {
+    match span.set_parent(cx) {
+        // Without an OTLP endpoint the OpenTelemetry layer isn't installed, and a span filtered
+        // out by the log level has nothing to link; neither is an error.
+        Ok(()) | Err(SetParentError::LayerNotFound | SetParentError::SpanDisabled) => {}
+        Err(e) => record_error!(parent: span, &e),
+    }
 }
+
+/// Reports the error behind `$e` (a `&E` where `E: Error`) once, as an `error!` event in the
+/// current span, or in `parent` if given.
+///
+/// The fmt layer prints the event to stdout. The OpenTelemetry layer sets the span status to
+/// ERROR with the error text as description, and turns the event into an `exception` event
+/// carrying the text, the Rust type of the error and its chain of causes.
+// Two arms rather than an optional `parent:` prefix: `parent` can also start an expression, so a
+// single arm is ambiguous to `macro_rules!`.
+macro_rules! record_error {
+    (parent: $span:expr, $e:expr) => {{
+        let e = $e;
+        ::tracing::error!(
+            parent: $span,
+            error = %e,
+            exception.type = $crate::telemetry::error_type(e),
+            exception.stacktrace = $crate::telemetry::error_chain(e).as_deref(),
+        );
+    }};
+    ($e:expr) => {{
+        let e = $e;
+        ::tracing::error!(
+            error = %e,
+            exception.type = $crate::telemetry::error_type(e),
+            exception.stacktrace = $crate::telemetry::error_chain(e).as_deref(),
+        );
+    }};
+}
+pub(crate) use record_error;
+
+#[doc(hidden)]
+pub(crate) fn error_type<E: Error>(_: &E) -> &'static str {
+    std::any::type_name::<E>()
+}
+
+/// The messages of the error's sources, outermost first, or `None` if it has no source.
+#[doc(hidden)]
+pub(crate) fn error_chain<E: Error>(e: &E) -> Option<String> {
+    let mut causes = Vec::new();
+    let mut source = e.source();
+
+    while let Some(cause) = source {
+        causes.push(cause.to_string());
+        source = cause.source();
+    }
+
+    (!causes.is_empty()).then(|| causes.join(": "))
+}
+
+/// Span for a message exchanged between actors. Internal to the `producer_span!` and
+/// `consumer_span!` helpers.
+///
+/// Any trailing `$fields` are passed through to `info_span!` as extra span fields.
+/// The span name has to be a literal, which is why these helpers are macros.
+#[doc(hidden)]
+macro_rules! message_span {
+    (
+        name = $name:literal,
+        kind = $kind:literal,
+        operation = ($operation_name:literal, $operation_type:literal),
+        message = $message:ident,
+        destination = $destination:literal
+        $(, $($fields:tt)*)?
+    ) => {
+        ::tracing::info_span!(
+            $name,
+            otel.kind = $kind,
+            messaging.system = "actix",
+            actor.message.type = stringify!($message),
+            messaging.operation.name = $operation_name,
+            messaging.operation.type = $operation_type,
+            messaging.destination.name = $destination,
+            $($($fields)*)?
+        )
+    };
+}
+pub(crate) use message_span;
+
+/// Span for sending `message` to the `destination` actor. Enter it, then put its `context()` in
+/// the message so that the receiving handler can parent its span to it.
+///
+/// Any trailing `$fields` are passed through to `info_span!` as extra span fields.
+macro_rules! producer_span {
+    (
+        name = $name:literal,
+        message = $message:ident,
+        destination = $destination:literal
+        $(, $($fields:tt)*)?
+    ) => {
+        $crate::telemetry::message_span!(
+            name = $name,
+            kind = "producer",
+            operation = ("send", "send"),
+            message = $message,
+            destination = $destination
+            $(, $($fields)*)?
+        )
+    };
+}
+pub(crate) use producer_span;
+
+/// Span for handling `message` in the `destination` actor, parented to the context carried by
+/// the message. Must be created before it is entered (see `set_parent_context`).
+///
+/// Any trailing `$fields` are passed through to `info_span!` as extra span fields.
+macro_rules! consumer_span {
+    (
+        name = $name:literal,
+        message = $message:ident,
+        parent = $parent:expr,
+        destination = $destination:literal
+        $(, $($fields:tt)*)?
+    ) => {{
+        let span = $crate::telemetry::message_span!(
+            name = $name,
+            kind = "consumer",
+            operation = ("handle", "process"),
+            message = $message,
+            destination = $destination
+            $(, $($fields)*)?
+        );
+        $crate::telemetry::set_parent_context(&span, $parent);
+        span
+    }};
+}
+pub(crate) use consumer_span;
 
 pub fn init_telemetry() -> Result<Option<SdkTracerProvider>, Box<dyn Error>> {
     let filter_layer = EnvFilter::try_from_default_env()

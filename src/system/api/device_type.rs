@@ -3,6 +3,7 @@ use tapo::{
     ApiClient, ColorLightHandler, LightHandler, PlugEnergyMonitoringHandler, PlugHandler,
     RgbLightStripHandler, RgbicLightStripHandler,
 };
+use tracing::instrument;
 
 /// The type of a device. Each variant maps to a Tapo handler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -38,25 +39,29 @@ pub enum DeviceHandler {
 }
 
 impl DeviceHandler {
+    #[instrument(name = "DeviceHandler::new", skip_all, fields(
+        device.ip_address = %ip_address,
+        device.device_type = ?device_type,
+    ))]
     pub async fn new(
         client: ApiClient,
         device_type: DeviceType,
         ip_address: String,
     ) -> Result<Self, tapo::Error> {
-        let handler = match device_type {
-            DeviceType::Light => Self::Light(client.l510(ip_address).await?),
-            DeviceType::ColorLight => Self::ColorLight(client.l530(ip_address).await?),
-            DeviceType::RgbLightStrip => Self::RgbLightStrip(client.l900(ip_address).await?),
-            DeviceType::RgbicLightStrip => Self::RgbicLightStrip(client.l920(ip_address).await?),
-            DeviceType::Plug => Self::Plug(client.p100(ip_address).await?),
-            DeviceType::PlugEnergyMonitoring => {
-                Self::PlugEnergyMonitoring(client.p110(ip_address).await?)
-            }
-        };
-
-        Ok(handler)
+        match device_type {
+            DeviceType::Light => client.l510(ip_address).await.map(Self::Light),
+            DeviceType::ColorLight => client.l530(ip_address).await.map(Self::ColorLight),
+            DeviceType::RgbLightStrip => client.l900(ip_address).await.map(Self::RgbLightStrip),
+            DeviceType::RgbicLightStrip => client.l920(ip_address).await.map(Self::RgbicLightStrip),
+            DeviceType::Plug => client.p100(ip_address).await.map(Self::Plug),
+            DeviceType::PlugEnergyMonitoring => client
+                .p110(ip_address)
+                .await
+                .map(Self::PlugEnergyMonitoring),
+        }
     }
 
+    #[instrument(name = "DeviceHandler::on", skip_all)]
     pub async fn on(&self) -> Result<(), tapo::Error> {
         match self {
             Self::Light(handler) => handler.on().await,
@@ -68,6 +73,7 @@ impl DeviceHandler {
         }
     }
 
+    #[instrument(name = "DeviceHandler::off", skip_all)]
     pub async fn off(&self) -> Result<(), tapo::Error> {
         match self {
             Self::Light(handler) => handler.off().await,
@@ -79,15 +85,18 @@ impl DeviceHandler {
         }
     }
 
+    #[instrument(name = "DeviceHandler::state", skip_all)]
     pub async fn state(&self) -> Result<DeviceState, tapo::Error> {
         let on = match self {
-            Self::Light(handler) => handler.get_device_info().await?.device_on,
-            Self::ColorLight(handler) => handler.get_device_info().await?.device_on,
-            Self::RgbLightStrip(handler) => handler.get_device_info().await?.device_on,
-            Self::RgbicLightStrip(handler) => handler.get_device_info().await?.device_on,
-            Self::Plug(handler) => handler.get_device_info().await?.device_on,
-            Self::PlugEnergyMonitoring(handler) => handler.get_device_info().await?.device_on,
-        };
+            Self::Light(handler) => handler.get_device_info().await.map(|i| i.device_on),
+            Self::ColorLight(handler) => handler.get_device_info().await.map(|i| i.device_on),
+            Self::RgbLightStrip(handler) => handler.get_device_info().await.map(|i| i.device_on),
+            Self::RgbicLightStrip(handler) => handler.get_device_info().await.map(|i| i.device_on),
+            Self::Plug(handler) => handler.get_device_info().await.map(|i| i.device_on),
+            Self::PlugEnergyMonitoring(handler) => {
+                handler.get_device_info().await.map(|i| i.device_on)
+            }
+        }?;
 
         Ok(DeviceState { on: Some(on) })
     }

@@ -16,7 +16,7 @@ use crate::system::api::api_actor::ApiActor;
 use crate::system::device_actor::DeviceActor;
 use crate::system::messages::{DeviceUsageMessage, HealthCheckMessage, StopMessage};
 use crate::system::mqtt_actor::MqttActor;
-use crate::telemetry::record_error;
+use crate::telemetry::{consumer_span, producer_span, record_error};
 
 #[derive(Debug)]
 pub struct CoordinatorActor {
@@ -28,19 +28,10 @@ pub struct CoordinatorActor {
 }
 
 impl CoordinatorActor {
-    #[instrument(name = "CoordinatorActor::new", skip_all, fields(
-        otel.status_code = tracing::field::Empty,
-        exception.type = tracing::field::Empty,
-        exception.message = tracing::field::Empty,
-        exception.stacktrace = tracing::field::Empty,
-    ))]
+    #[instrument(name = "CoordinatorActor::new", skip_all)]
     pub fn new(settings: Settings) -> anyhow::Result<Self> {
-        let span = tracing::Span::current();
-
         let mqtt_actor = MqttActor::new(settings.mqtt.clone())
-            .inspect_err(|e| {
-                record_error(&span, e);
-            })
+            .inspect_err(|e| record_error!(e))
             .context("Failed to create the MQTT actor")?;
         let mqtt_actor_addr = mqtt_actor.start();
 
@@ -75,24 +66,17 @@ impl Actor for CoordinatorActor {
             loop {
                 interval.tick().await;
 
-                let span = tracing::info_span!(
-                    "CoordinatorActor::IntervalTick",
-                    otel.kind = "producer",
-                    messaging.message.id = "HealthCheckMessage",
-                    messaging.operation.name = "send",
-                    messaging.operation.type = "send",
-                    messaging.destination.name = "CoordinatorActor",
-                    otel.status_code = tracing::field::Empty,
-                    exception.type = tracing::field::Empty,
-                    exception.message = tracing::field::Empty,
-                    exception.stacktrace = tracing::field::Empty,
+                let span = producer_span!(
+                    name = "CoordinatorActor::IntervalTick",
+                    message = HealthCheckMessage,
+                    destination = "CoordinatorActor",
                 );
                 let _enter = span.enter();
 
                 if let Err(e) = addr.try_send(HealthCheckMessage {
                     span_context: span.context(),
                 }) {
-                    record_error(&span, &e);
+                    record_error!(&e);
                 }
             }
         }
@@ -108,19 +92,14 @@ impl Actor for CoordinatorActor {
 impl Handler<HealthCheckMessage> for CoordinatorActor {
     type Result = ();
 
-    #[instrument(
-        name = "CoordinatorActor::Handler<HealthCheckMessage>",
-        skip_all,
-        fields(
-            otel.kind = "consumer",
-            messaging.message.id = "HealthCheckMessage",
-            messaging.operation.name = "poll",
-            messaging.operation.type = "receive",
-            messaging.destination.name = "CoordinatorActor",
-        )
-    )]
     fn handle(&mut self, message: HealthCheckMessage, ctx: &mut Context<Self>) -> Self::Result {
-        let _ = tracing::Span::current().set_parent(message.span_context);
+        let span = consumer_span!(
+            name = "CoordinatorActor::Handler<HealthCheckMessage>",
+            message = HealthCheckMessage,
+            parent = message.span_context,
+            destination = "CoordinatorActor",
+        );
+        let _enter = span.enter();
 
         // don't restart the actors that are being stopped
         if self.shutting_down {
@@ -137,36 +116,30 @@ impl Handler<HealthCheckMessage> for CoordinatorActor {
         // check mqtt
         if !self.mqtt_actor_addr.connected() {
             warn!("MQTT Actor is not connected, restarting...");
-            let mqtt_actor = MqttActor::new(self.settings.mqtt.clone())
-                .expect("failed to create the MQTT client");
-            self.mqtt_actor_addr = mqtt_actor.start();
+            // retried on the next tick
+            match MqttActor::new(self.settings.mqtt.clone()) {
+                Ok(mqtt_actor) => self.mqtt_actor_addr = mqtt_actor.start(),
+                Err(e) => record_error!(&e),
+            }
         }
 
         // check devices
         let addr = ctx.address();
 
         for device in &self.settings.devices {
-            if self.device_actors.contains_key(&device.ip_address) {
-                let device_actor = self.device_actors.get(&device.ip_address);
-
-                if let Some(device_actor) = device_actor {
-                    if device_actor.connected() {
-                        // device actor is alive and well, nothing to do here
-                        continue;
-                    } else {
-                        warn!(
-                            device.name = device.name,
-                            device.ip_address = device.ip_address,
-                            "Device actor is not connected, restarting...",
-                        );
-                    }
-                }
-            } else {
-                info!(
+            match self.device_actors.get(&device.ip_address) {
+                // device actor is alive and well, nothing to do here
+                Some(device_actor) if device_actor.connected() => continue,
+                Some(_) => warn!(
+                    device.name = device.name,
+                    device.ip_address = device.ip_address,
+                    "Device actor is not connected, restarting...",
+                ),
+                None => info!(
                     device.name = device.name,
                     device.ip_address = device.ip_address,
                     "Device actor not found, creating a new one...",
-                );
+                ),
             }
 
             // device actor hasn't been created yet or has died -> (re)create
@@ -191,14 +164,14 @@ impl Handler<StopMessage> for CoordinatorActor {
         let api_actor_addr = self.api_actor_addr.clone();
         let mqtt_actor_addr = self.mqtt_actor_addr.clone();
 
-        // MQTT goes last so that usage already queued by the device actors can still be published.
+        // The device actors go first so that usage they have already queued can still be
+        // published. The API and MQTT drains overlap to stay inside the shutdown timeout.
         Box::pin(
             async move {
                 for device_actor in device_actors {
                     stop_actor(device_actor).await;
                 }
-                stop_actor(api_actor_addr).await;
-                stop_actor(mqtt_actor_addr).await;
+                tokio::join!(stop_actor(api_actor_addr), stop_actor(mqtt_actor_addr));
             }
             .into_actor(self)
             .map(|_, _, ctx| ctx.stop()),
@@ -223,26 +196,16 @@ where
 impl Handler<DeviceUsageMessage> for CoordinatorActor {
     type Result = ();
 
-    #[instrument(
-        name = "CoordinatorActor::Handler<DeviceUsageMessage>",
-        skip_all,
-        fields(
-            otel.kind = "consumer",
-            messaging.message.id = "DeviceUsageMessage",
-            messaging.operation.name = "poll",
-            messaging.operation.type = "receive",
-            messaging.destination.name = "CoordinatorActor",
+    fn handle(&mut self, message: DeviceUsageMessage, _: &mut Context<Self>) -> Self::Result {
+        let span = consumer_span!(
+            name = "CoordinatorActor::Handler<DeviceUsageMessage>",
+            message = DeviceUsageMessage,
+            parent = message.span_context,
+            destination = "CoordinatorActor",
             device.name = %message.device.name,
             device.ip_address = %message.device.ip_address,
-            otel.status_code = tracing::field::Empty,
-            exception.type = tracing::field::Empty,
-            exception.message = tracing::field::Empty,
-            exception.stacktrace = tracing::field::Empty,
-        )
-    )]
-    fn handle(&mut self, message: DeviceUsageMessage, _: &mut Context<Self>) -> Self::Result {
-        let span = tracing::Span::current();
-        let _ = span.set_parent(message.span_context);
+        );
+        let _enter = span.enter();
 
         let result = self.mqtt_actor_addr.try_send({
             DeviceUsageMessage {
@@ -253,7 +216,7 @@ impl Handler<DeviceUsageMessage> for CoordinatorActor {
         });
 
         if let Err(e) = result {
-            record_error(&span, &e);
+            record_error!(&e);
         }
     }
 }
