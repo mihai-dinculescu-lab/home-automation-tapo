@@ -14,7 +14,7 @@ use crate::{
     system::coordinator_actor::CoordinatorActor,
     system::messages::{EvaluateMessage, GetSensorReadingMessage, SensorReading, StopMessage},
     system::thermostat::decision::{
-        HeaterCommand, Presence, PresenceError, decide, person_present,
+        Decision, HeaterCommand, Presence, PresenceError, Reason, decide, person_present,
     },
     telemetry::{consumer_span, producer_span, record_error},
 };
@@ -28,13 +28,19 @@ pub struct ThermostatActor {
     coordinator_actor_addr: Addr<CoordinatorActor>,
     tapo: Tapo,
     config: Thermostat,
-    /// The evaluation in flight, if any. The next tick cancels it, so that a slow one can
-    /// neither hold the thermostat for several intervals nor finish after a newer one and switch
-    /// the heaters on older inputs; a stop cancels it, so that it cannot switch the heaters on
-    /// after they were switched off.
-    evaluating: Option<SpawnHandle>,
+    /// The tick's work in flight, if any: an evaluation, or the switch-off outside the active
+    /// period. The next tick cancels it, so that a slow one can neither hold the thermostat for
+    /// several intervals nor finish after a newer one and switch the heaters on older inputs; a
+    /// stop cancels it, so that it cannot switch the heaters on after they were switched off.
+    in_flight: Option<SpawnHandle>,
     /// Set by the stop, so that ticks still queued are ignored while the heaters are switched off.
     stopping: bool,
+    /// The heaters still to be switched off for the stretch outside the active period, once the
+    /// first tick outside it has tried; `None` before that, at the start and after every tick
+    /// inside the period, so that each heater gets the Off once per period end and once at a
+    /// start outside the period, where a run that crashed may have left it on. A heater that
+    /// could not be switched is kept for the next tick, the ones that were are left alone.
+    pending_off: Option<Vec<Heater>>,
 }
 
 impl ThermostatActor {
@@ -50,9 +56,52 @@ impl ThermostatActor {
             coordinator_actor_addr,
             tapo,
             config,
-            evaluating: None,
+            in_flight: None,
             stopping: false,
+            pending_off: None,
         }
+    }
+
+    /// Cancels the tick's work in flight, if any. A cancelled evaluation leaves the heaters as
+    /// they are and a cancelled switch-off leaves the unswitched heaters pending, so the caller
+    /// asserts them anew.
+    fn cancel_in_flight(&mut self, ctx: &mut Context<Self>) {
+        if let Some(in_flight) = self.in_flight.take() {
+            warn!("The previous tick's work is still running, cancelling it");
+            ctx.cancel_future(in_flight);
+        }
+    }
+
+    /// Records a decision on the tick's span and in the log, the one place that names its fields.
+    fn record_decision(span: &tracing::Span, name: &str, decision: Decision) {
+        span.record(
+            "thermostat.command",
+            tracing::field::display(decision.command),
+        );
+        span.record(
+            "thermostat.reason",
+            tracing::field::display(decision.reason),
+        );
+
+        info!(
+            "Thermostat '{name}': {} ({})",
+            decision.command, decision.reason
+        );
+    }
+
+    /// Records why a tick did nothing, the counterpart of `record_decision` for a skipped tick.
+    fn record_skip(span: &tracing::Span, reason: Reason) {
+        span.record("thermostat.reason", tracing::field::display(reason));
+        debug!("Skipping this tick ({reason})");
+    }
+
+    /// Switches the given heaters off in the current span. Resolves to the heaters that could
+    /// not be switched.
+    fn switch_off(&self, heaters: Vec<Heater>) -> impl Future<Output = Vec<Heater>> + 'static {
+        let tapo = self.tapo.clone();
+
+        async move { Self::switch_heaters(&tapo, heaters, false).await }
+            .instrument(tracing::Span::current())
     }
 
     /// One tick: read the inputs, decide, and switch the heaters.
@@ -85,20 +134,7 @@ impl ThermostatActor {
         }
 
         let decision = decide(now, presence, reading.as_ref(), &config);
-
-        span.record(
-            "thermostat.command",
-            tracing::field::display(decision.command),
-        );
-        span.record(
-            "thermostat.reason",
-            tracing::field::display(decision.reason),
-        );
-
-        info!(
-            "Thermostat '{}': {} ({})",
-            config.name, decision.command, decision.reason
-        );
+        Self::record_decision(&span, &config.name, decision);
 
         let on = match decision.command {
             HeaterCommand::On => true,
@@ -106,19 +142,26 @@ impl ThermostatActor {
             HeaterCommand::Keep => return,
         };
 
-        Self::switch_heaters(&tapo, &config.heaters, on).await;
+        Self::switch_heaters(&tapo, config.heaters, on).await;
     }
 
     /// The heaters are independent, so they are switched together: the time taken is that of
     /// the slowest plug rather than the sum, which matters for the tick deadline and even more
-    /// for the shutdown budget.
-    async fn switch_heaters(tapo: &Tapo, heaters: &[Heater], on: bool) {
-        join_all(
+    /// for the shutdown budget. Returns the heaters that could not be switched.
+    async fn switch_heaters(tapo: &Tapo, heaters: Vec<Heater>, on: bool) -> Vec<Heater> {
+        let switched = join_all(
             heaters
                 .iter()
                 .map(|heater| Self::switch_heater(tapo, heater, on)),
         )
         .await;
+
+        heaters
+            .into_iter()
+            .zip(switched)
+            .filter(|(_, switched)| !switched)
+            .map(|(heater, _)| heater)
+            .collect()
     }
 
     async fn query_reading(
@@ -175,7 +218,7 @@ impl ThermostatActor {
         heater.ip_address = %heater.ip_address,
         heater.on = on,
     ))]
-    async fn switch_heater(tapo: &Tapo, heater: &Heater, on: bool) {
+    async fn switch_heater(tapo: &Tapo, heater: &Heater, on: bool) -> bool {
         let result = async {
             let handler = tapo.client().p110(heater.ip_address.clone()).await?;
 
@@ -188,12 +231,18 @@ impl ThermostatActor {
         .await;
 
         match result {
-            Ok(()) => info!(
-                "Switched heater '{}' {}",
-                heater.name,
-                if on { "on" } else { "off" }
-            ),
-            Err(e) => record_error!(&e),
+            Ok(()) => {
+                info!(
+                    "Switched heater '{}' {}",
+                    heater.name,
+                    if on { "on" } else { "off" }
+                );
+                true
+            }
+            Err(e) => {
+                record_error!(&e);
+                false
+            }
         }
     }
 }
@@ -258,17 +307,15 @@ impl Handler<StopMessage> for ThermostatActor {
         self.stopping = true;
 
         // An evaluation still in flight could switch the heaters on after they were switched off.
-        if let Some(evaluating) = self.evaluating.take() {
-            ctx.cancel_future(evaluating);
+        // Unlike at a tick, cutting it short here is expected, so nothing is logged.
+        if let Some(in_flight) = self.in_flight.take() {
+            ctx.cancel_future(in_flight);
         }
 
-        let tapo = self.tapo.clone();
-        let heaters = self.config.heaters.clone();
+        let switch_off = self.switch_off(self.config.heaters.clone());
 
         Box::pin(
             async move {
-                let switch_off = Self::switch_heaters(&tapo, &heaters, false);
-
                 if let Err(e) = tokio::time::timeout(STOP_TIMEOUT, switch_off).await {
                     record_error!(&e);
                 }
@@ -299,15 +346,49 @@ impl Handler<EvaluateMessage> for ThermostatActor {
         let _enter = span.enter();
 
         if self.stopping {
-            debug!("The thermostat is stopping, skipping this tick");
+            Self::record_skip(&span, Reason::Stopping);
             return;
         }
 
-        // A cancelled evaluation leaves the heaters as they are; this tick asserts them anew.
-        if let Some(evaluating) = self.evaluating.take() {
-            warn!("The previous evaluation is still running, cancelling it");
-            ctx.cancel_future(evaluating);
+        // Every handled tick asserts the heaters anew, so whatever the previous one left running
+        // is cancelled before it can switch them on older inputs.
+        self.cancel_in_flight(ctx);
+
+        // Outside the active period nothing is queried. Each heater is switched off once, by the
+        // first tick outside it, and then left alone; one that could not be switched is retried
+        // on the next tick, as nobody checks presence or temperature until the period starts.
+        if let Some(period) = &self.config.active_period
+            && !period.contains(Utc::now())
+        {
+            let heaters = self
+                .pending_off
+                .clone()
+                .unwrap_or_else(|| self.config.heaters.clone());
+
+            if heaters.is_empty() {
+                Self::record_skip(&span, Reason::OutsideActivePeriod);
+                return;
+            }
+
+            Self::record_decision(
+                &span,
+                &self.config.name,
+                Decision::new(HeaterCommand::Off, Reason::OutsideActivePeriod),
+            );
+
+            let fut = self
+                .switch_off(heaters)
+                .into_actor(self)
+                .map(|not_switched, act, _| {
+                    act.in_flight = None;
+                    act.pending_off = Some(not_switched);
+                });
+
+            self.in_flight = Some(ctx.spawn(fut));
+            return;
         }
+
+        self.pending_off = None;
 
         let fut = Self::evaluate(
             self.coordinator_actor_addr.clone(),
@@ -316,8 +397,8 @@ impl Handler<EvaluateMessage> for ThermostatActor {
         )
         .instrument(span.clone())
         .into_actor(self)
-        .map(|_, act, _| act.evaluating = None);
+        .map(|_, act, _| act.in_flight = None);
 
-        self.evaluating = Some(ctx.spawn(fut));
+        self.in_flight = Some(ctx.spawn(fut));
     }
 }

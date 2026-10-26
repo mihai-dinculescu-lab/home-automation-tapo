@@ -76,6 +76,14 @@ thermostat requires `mqtt.sensors` to be enabled. Person detection is read from 
 `get_detections`, so it has to be enabled in the Tapo app, and `presence_window_s` is capped at 24 hours by the camera.
 It also has to be at least `interval_s`, otherwise a person detected between two ticks can go unnoticed.
 
+`active_period` limits a thermostat to part of the day, from `start` (inclusive) to `end` (exclusive) as `HH:MM`
+in `time_zone` (an IANA name such as `Europe/London`); an `end` before `start` crosses midnight. Outside the period
+nothing is queried: the first tick after the period ends switches the heaters off, the following ticks send no
+command, and only a plug that could not be switched is retried on the next tick. A start outside the period
+switches them off the same way, which covers plugs left on by a run that crashed. The period has to last at least
+`interval_s`, otherwise it can pass between two ticks. `active_period` is optional; without it the thermostat runs
+around the clock.
+
 `thermostats` is optional; leaving it out or empty disables the thermostat, and a single entry can be switched off
 with `enabled: false`, which leaves its heaters alone.
 

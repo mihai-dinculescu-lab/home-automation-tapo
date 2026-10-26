@@ -2,7 +2,9 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::ensure;
-use serde::Deserialize;
+use chrono::{DateTime, NaiveTime, Utc};
+use chrono_tz::Tz;
+use serde::{Deserialize, Deserializer};
 use tapo::ApiClient;
 
 /// The longest window the camera's detection search accepts.
@@ -66,11 +68,62 @@ pub struct Heater {
     pub ip_address: String,
 }
 
+/// The part of the day in which a thermostat runs. Outside it, nothing is queried: the heaters
+/// are switched off once when the period ends and then left alone.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ActivePeriod {
+    /// Inclusive, as `HH:MM` in `time_zone`.
+    #[serde(deserialize_with = "deserialize_time")]
+    pub start: NaiveTime,
+    /// Exclusive, as `HH:MM` in `time_zone`. An end before the start crosses midnight.
+    #[serde(deserialize_with = "deserialize_time")]
+    pub end: NaiveTime,
+    /// IANA name, e.g. `Europe/London`, so that the period follows the local clock across the
+    /// daylight saving changes rather than the container's, which is UTC.
+    pub time_zone: Tz,
+}
+
+impl ActivePeriod {
+    /// How long the period lasts, as the local clock goes; a period crossing midnight is counted
+    /// around it.
+    fn length(&self) -> chrono::Duration {
+        let length = self.end - self.start;
+
+        if length < chrono::Duration::zero() {
+            length + chrono::Duration::days(1)
+        } else {
+            length
+        }
+    }
+
+    /// Whether `now` falls in the period.
+    pub fn contains(&self, now: DateTime<Utc>) -> bool {
+        let time = now.with_timezone(&self.time_zone).time();
+
+        if self.start < self.end {
+            self.start <= time && time < self.end
+        } else {
+            self.start <= time || time < self.end
+        }
+    }
+}
+
+/// `HH:MM` rather than chrono's own `HH:MM:SS`, which nobody writes in a settings file.
+fn deserialize_time<'de, D: Deserializer<'de>>(deserializer: D) -> Result<NaiveTime, D::Error> {
+    let s = String::deserialize(deserializer)?;
+
+    NaiveTime::parse_from_str(&s, "%H:%M").map_err(|e| {
+        serde::de::Error::custom(format!("'{s}' is not a time in the HH:MM format: {e}"))
+    })
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Thermostat {
     pub name: String,
     /// A disabled thermostat is not started and leaves its heaters alone.
     pub enabled: bool,
+    /// Optional; without it, the thermostat runs around the clock.
+    pub active_period: Option<ActivePeriod>,
     /// Camera whose person detections decide presence.
     pub camera_ip_address: String,
     /// Matches the `location` field of the sensor payload.
@@ -125,8 +178,10 @@ impl Settings {
     /// never sees anyone, a presence window over 24 hours is refused by the camera on every
     /// tick, a zero reading age makes every reading stale and an oversized one overflows the
     /// age arithmetic, a negative deadband inverts the rules, a non-finite temperature makes
-    /// every comparison false, a duplicate key makes the coordinator skip an entry, and a
-    /// thermostat without the sensors would never see a reading.
+    /// every comparison false, a duplicate key makes the coordinator skip an entry, a thermostat
+    /// without the sensors would never see a reading, an active period that starts when it ends
+    /// is either empty or the whole day, which the thermostat cannot tell apart, and one shorter
+    /// than the interval can pass between two ticks without either landing in it.
     fn validate(&self) -> Result<(), anyhow::Error> {
         ensure!(
             self.tapo.refresh_rate_s > 0,
@@ -189,6 +244,18 @@ impl Settings {
                 "Thermostat '{name}' is enabled but mqtt.sensors is not, so it would never see \
                  a reading"
             );
+            if let Some(period) = &thermostat.active_period {
+                ensure!(
+                    period.start != period.end,
+                    "Thermostat '{name}': active_period.start and active_period.end must differ; \
+                     leave active_period out to run around the clock"
+                );
+                ensure!(
+                    period.length() >= chrono::Duration::seconds(thermostat.interval_s as i64),
+                    "Thermostat '{name}': active_period must last at least interval_s, otherwise \
+                     it can pass between two ticks"
+                );
+            }
         }
 
         Ok(())
@@ -203,6 +270,7 @@ mod tests {
         Thermostat {
             name: name.to_string(),
             enabled: true,
+            active_period: None,
             camera_ip_address: "192.168.1.154".to_string(),
             sensor_location: "Living Room".to_string(),
             heaters: vec![],
@@ -394,5 +462,154 @@ mod tests {
         settings.thermostats[0].enabled = false;
 
         settings.validate().unwrap();
+    }
+
+    fn period(start: &str, end: &str) -> ActivePeriod {
+        ActivePeriod {
+            start: NaiveTime::parse_from_str(start, "%H:%M").unwrap(),
+            end: NaiveTime::parse_from_str(end, "%H:%M").unwrap(),
+            time_zone: chrono_tz::Europe::London,
+        }
+    }
+
+    /// A UTC instant from a London wall-clock time on the given day.
+    fn london(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<Utc> {
+        use chrono::TimeZone;
+
+        chrono_tz::Europe::London
+            .with_ymd_and_hms(y, m, d, h, min, 0)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn active_period_with_the_same_start_and_end_is_rejected() {
+        let mut settings = settings();
+        settings.thermostats[0].active_period = Some(period("08:00", "08:00"));
+
+        assert!(error(&settings).contains("active_period"));
+    }
+
+    #[test]
+    fn active_period_passes() {
+        let mut settings = settings();
+        settings.thermostats[0].active_period = Some(period("08:00", "22:00"));
+
+        settings.validate().unwrap();
+    }
+
+    #[test]
+    fn active_period_shorter_than_interval_is_rejected() {
+        // interval_s is 300; the second period crosses midnight.
+        for (start, end) in [("08:00", "08:04"), ("23:58", "00:02")] {
+            let mut settings = settings();
+            settings.thermostats[0].active_period = Some(period(start, end));
+
+            assert!(
+                error(&settings).contains("active_period must last at least interval_s"),
+                "period {start}-{end}"
+            );
+        }
+    }
+
+    #[test]
+    fn active_period_as_long_as_interval_passes() {
+        for (start, end) in [("08:00", "08:05"), ("23:58", "00:03")] {
+            let mut settings = settings();
+            settings.thermostats[0].active_period = Some(period(start, end));
+
+            settings.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn active_period_is_read_from_yaml() {
+        let yaml = r#"
+api: { host: 127.0.0.1, port: 8080 }
+tapo: { username: "", password: "", refresh_rate_s: 600 }
+mqtt:
+  address: tcp://localhost:1883
+  topic_name: devices/tapo
+  sensors: { enabled: true, topic_name: "sensors/#" }
+devices: []
+thermostats:
+  - name: Living Room
+    enabled: true
+    active_period:
+      start: "07:30"
+      end: "22:00"
+      time_zone: Europe/London
+    camera_ip_address: 192.168.1.154
+    sensor_location: Living Room
+    target_temperature: 22.0
+    deadband: 0.25
+    presence_window_s: 900
+    reading_max_age_s: 900
+    interval_s: 300
+"#;
+
+        let settings = config::Config::builder()
+            .add_source(config::File::from_str(yaml, config::FileFormat::Yaml))
+            .build()
+            .unwrap()
+            .try_deserialize::<Settings>()
+            .unwrap();
+        settings.validate().unwrap();
+
+        let period = settings.thermostats[0].active_period.as_ref().unwrap();
+        assert_eq!(period.start, NaiveTime::from_hms_opt(7, 30, 0).unwrap());
+        assert_eq!(period.end, NaiveTime::from_hms_opt(22, 0, 0).unwrap());
+        assert_eq!(period.time_zone, chrono_tz::Europe::London);
+    }
+
+    #[test]
+    fn active_period_includes_the_start_and_excludes_the_end() {
+        let period = period("08:00", "22:00");
+
+        assert!(!period.contains(london(2026, 10, 26, 7, 59)));
+        assert!(period.contains(london(2026, 10, 26, 8, 0)));
+        assert!(period.contains(london(2026, 10, 26, 21, 59)));
+        assert!(!period.contains(london(2026, 10, 26, 22, 0)));
+        assert!(!period.contains(london(2026, 10, 26, 3, 0)));
+    }
+
+    #[test]
+    fn active_period_crossing_midnight() {
+        let period = period("22:00", "06:00");
+
+        assert!(period.contains(london(2026, 10, 26, 22, 0)));
+        assert!(period.contains(london(2026, 10, 26, 23, 59)));
+        assert!(period.contains(london(2026, 10, 27, 0, 0)));
+        assert!(period.contains(london(2026, 10, 27, 5, 59)));
+        assert!(!period.contains(london(2026, 10, 27, 6, 0)));
+        assert!(!period.contains(london(2026, 10, 27, 12, 0)));
+    }
+
+    #[test]
+    fn active_period_follows_the_local_clock_through_daylight_saving() {
+        let period = period("08:00", "22:00");
+        let utc = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
+
+        // British Summer Time: 07:30 UTC is 08:30 in London.
+        assert!(period.contains(utc("2026-07-01T07:30:00Z")));
+        // Greenwich Mean Time: 07:30 UTC is 07:30 in London.
+        assert!(!period.contains(utc("2026-12-01T07:30:00Z")));
+    }
+
+    #[test]
+    fn time_is_parsed_from_hh_mm() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(deserialize_with = "deserialize_time")]
+            time: NaiveTime,
+        }
+
+        let wrapper: Wrapper = serde_json::from_str(r#"{"time": "08:05"}"#).unwrap();
+        assert_eq!(wrapper.time, NaiveTime::from_hms_opt(8, 5, 0).unwrap());
+
+        for invalid in ["8am", "08:00:00", "24:00", ""] {
+            let result = serde_json::from_str::<Wrapper>(&format!(r#"{{"time": "{invalid}"}}"#));
+            assert!(result.is_err(), "'{invalid}' should be rejected");
+        }
     }
 }

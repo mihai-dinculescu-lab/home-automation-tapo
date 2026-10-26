@@ -20,8 +20,14 @@ pub enum HeaterCommand {
     Keep,
 }
 
+/// Why the heaters were commanded, or why a tick was skipped. The first two are recorded by the
+/// actor rather than by `decide`, so that the span's vocabulary stays in one place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
 pub enum Reason {
+    /// The tick fell outside the active period.
+    OutsideActivePeriod,
+    /// The thermostat is stopping.
+    Stopping,
     CameraError,
     NobodyPresent,
     NoReading,
@@ -38,7 +44,7 @@ pub struct Decision {
 }
 
 impl Decision {
-    fn new(command: HeaterCommand, reason: Reason) -> Self {
+    pub fn new(command: HeaterCommand, reason: Reason) -> Self {
         Self { command, reason }
     }
 }
@@ -97,6 +103,7 @@ mod tests {
         Thermostat {
             name: "Living Room".to_string(),
             enabled: true,
+            active_period: None,
             camera_ip_address: "192.168.1.154".to_string(),
             sensor_location: "Living Room".to_string(),
             heaters: vec![],

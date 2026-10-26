@@ -25,6 +25,16 @@ thermostats:
   - name:
     # a disabled thermostat is not started and leaves its heaters alone
     enabled:
+    # optional, the part of the day in which the thermostat runs; outside it, nothing is queried:
+    # the heaters are switched off once when the period ends and then left alone. Leave it out
+    # to run around the clock
+    active_period:
+      # HH:MM, inclusive
+      start:
+      # HH:MM, exclusive; an end before the start crosses midnight
+      end:
+      # IANA name the times are in, e.g. Europe/London
+      time_zone:
     # camera whose person detections decide presence
     camera_ip_address:
     # matches the `location` field of the sensor payload
