@@ -8,7 +8,7 @@ use actix_web::{
 use anyhow::Context;
 use tracing_actix_web::TracingLogger;
 
-use crate::{settings::Tapo, system::api::handlers};
+use crate::system::{api::handlers, devices::Devices};
 
 pub struct WebServer {
     port: u16,
@@ -16,13 +16,13 @@ pub struct WebServer {
 }
 
 impl WebServer {
-    pub async fn new(host: &str, port: u16, tapo: Tapo) -> Result<Self, anyhow::Error> {
+    pub async fn new(host: &str, port: u16, devices: Devices) -> Result<Self, anyhow::Error> {
         let address = format!("{host}:{port}",);
 
         let listener = TcpListener::bind(address)?;
         let port = listener.local_addr()?.port();
 
-        let data = web::Data::new(tapo);
+        let data = web::Data::new(devices);
 
         let server = HttpServer::new(move || {
             App::new()

@@ -5,22 +5,23 @@ use actix::{
 use actix_web::dev::ServerHandle;
 use tracing::debug;
 
-use crate::settings::{Api, Tapo};
+use crate::settings::Api;
 use crate::system::api::web_server::WebServer;
+use crate::system::devices::Devices;
 use crate::system::messages::StopMessage;
 
 #[derive(Debug)]
 pub struct ApiActor {
     config_api: Api,
-    config_tapo: Tapo,
+    devices: Devices,
     server_handle: Option<ServerHandle>,
 }
 
 impl ApiActor {
-    pub fn new(config_api: Api, config_tapo: Tapo) -> Self {
+    pub fn new(config_api: Api, devices: Devices) -> Self {
         Self {
             config_api,
-            config_tapo,
+            devices,
             server_handle: None,
         }
     }
@@ -35,12 +36,12 @@ impl Actor for ApiActor {
         let host = self.config_api.host.clone();
         let port = self.config_api.port;
 
-        let tapo = self.config_tapo.clone();
+        let devices = self.devices.clone();
 
         // Only block the mailbox while the server is being created; it then runs in the
         // background so that StopMessage can still be handled.
         let fut = async move {
-            WebServer::new(&host, port, tapo)
+            WebServer::new(&host, port, devices)
                 .await
                 .expect("failed to create the API")
         }

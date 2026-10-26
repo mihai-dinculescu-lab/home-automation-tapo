@@ -1,4 +1,7 @@
-use home_automation_tapo::{settings::Tapo, system::api::web_server::WebServer};
+use home_automation_tapo::{
+    settings::Tapo,
+    system::{api::web_server::WebServer, devices::Devices},
+};
 
 pub struct TestApp {
     pub address: String,
@@ -12,7 +15,7 @@ impl TestApp {
             refresh_rate_s: 60,
         };
 
-        let web_server = WebServer::new("localhost", 0, tapo)
+        let web_server = WebServer::new("localhost", 0, Devices::new(tapo))
             .await
             .expect("Failed to build API");
 

@@ -1,11 +1,11 @@
 use actix_web::http::StatusCode;
 use actix_web::{HttpResponse, web};
+use futures_util::FutureExt as _;
 use serde::{Deserialize, Serialize};
 use tracing::{instrument, warn};
 
-use crate::settings::Tapo;
-use crate::system::api::device_type::{DeviceHandler, DeviceState, DeviceType};
 use crate::system::api::errors::ApiError;
+use crate::system::devices::{DeviceType, Devices, Error as DeviceError};
 use crate::telemetry::record_error;
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +21,12 @@ impl ApiStatusResponse {
             message: message.to_string(),
         }
     }
+}
+
+/// The state of a device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceState {
+    pub on: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -54,26 +60,19 @@ pub async fn health_check() -> HttpResponse {
     device.device_type = ?device.device_type,
 ))]
 pub async fn get_device(
-    config: web::Data<Tapo>,
+    devices: web::Data<Devices>,
     device: web::Json<GetDevicePayload>,
 ) -> Result<HttpResponse, ApiError> {
-    let client = config.client();
-    let handler = DeviceHandler::new(client, device.device_type, device.ip_address.clone())
+    let on = devices
+        .run(device.device_type, &device.ip_address, |handler| {
+            handler.device_on().boxed_local()
+        })
         .await
-        .map_err(|e| {
-            // a client error, so the request span isn't marked as failed
-            warn!(error = %e, "Failed to connect to the device");
-            ApiError::BadRequest("failed to connect to the device".to_string())
-        })?;
-
-    let state = handler.state().await.map_err(|e| {
-        record_error!(&e);
-        ApiError::InternalServerError
-    })?;
+        .map_err(api_error)?;
 
     let result = DeviceResponse {
         ip_address: device.ip_address.clone(),
-        state,
+        state: DeviceState { on: Some(on) },
     };
 
     Ok(HttpResponse::Ok().json(result))
@@ -85,27 +84,22 @@ pub async fn get_device(
     device.state.on = ?device.state.on,
 ))]
 pub async fn set_device(
-    config: web::Data<Tapo>,
+    devices: web::Data<Devices>,
     device: web::Json<SetDevicePayload>,
 ) -> Result<HttpResponse, ApiError> {
-    let client = config.client();
-    let handler = DeviceHandler::new(client, device.device_type, device.ip_address.clone())
-        .await
-        .map_err(|e| {
-            // a client error, so the request span isn't marked as failed
-            warn!(error = %e, "Failed to connect to the device");
-            ApiError::BadRequest("failed to connect to the device".to_string())
-        })?;
+    let on = device.state.on;
 
-    match device.state.on {
-        Some(true) => handler.on().await,
-        Some(false) => handler.off().await,
-        None => Ok(()),
-    }
-    .map_err(|e| {
-        record_error!(&e);
-        ApiError::InternalServerError
-    })?;
+    devices
+        .run(device.device_type, &device.ip_address, move |handler| {
+            match on {
+                Some(true) => handler.on().boxed_local(),
+                Some(false) => handler.off().boxed_local(),
+                // Still logs in, so that an unreachable device is reported.
+                None => async { Ok(()) }.boxed_local(),
+            }
+        })
+        .await
+        .map_err(api_error)?;
 
     let result = DeviceResponse {
         ip_address: device.ip_address.clone(),
@@ -113,4 +107,19 @@ pub async fn set_device(
     };
 
     Ok(HttpResponse::Ok().json(result))
+}
+
+/// A failed login is the client's error, e.g. a wrong address, so the request span isn't marked
+/// as failed; a failed request on a device that answered is ours.
+fn api_error(e: DeviceError) -> ApiError {
+    match &e {
+        DeviceError::Login(cause) => {
+            warn!(error = %cause, "Failed to connect to the device");
+            ApiError::BadRequest("failed to connect to the device".to_string())
+        }
+        DeviceError::Request(_) => {
+            record_error!(&e);
+            ApiError::InternalServerError
+        }
+    }
 }

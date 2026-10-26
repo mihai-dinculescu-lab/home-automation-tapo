@@ -5,13 +5,15 @@ use actix::{
     SpawnHandle, WrapFuture, clock::interval,
 };
 use chrono::{DateTime, Utc};
+use futures_util::FutureExt as _;
 use futures_util::future::join_all;
 use tracing::{Instrument, debug, info, instrument, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::{
-    settings::{Heater, Tapo, Thermostat},
+    settings::{Heater, Thermostat},
     system::coordinator_actor::CoordinatorActor,
+    system::devices::{DeviceType, Devices},
     system::messages::{EvaluateMessage, GetSensorReadingMessage, SensorReading, StopMessage},
     system::thermostat::decision::{
         Decision, HeaterCommand, Presence, PresenceError, Reason, decide, person_present,
@@ -26,7 +28,7 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug)]
 pub struct ThermostatActor {
     coordinator_actor_addr: Addr<CoordinatorActor>,
-    tapo: Tapo,
+    devices: Devices,
     config: Thermostat,
     /// The tick's work in flight, if any: an evaluation, or the switch-off outside the active
     /// period. The next tick cancels it, so that a slow one can neither hold the thermostat for
@@ -49,12 +51,12 @@ impl ThermostatActor {
     ))]
     pub fn new(
         coordinator_actor_addr: Addr<CoordinatorActor>,
-        tapo: Tapo,
+        devices: Devices,
         config: Thermostat,
     ) -> Self {
         Self {
             coordinator_actor_addr,
-            tapo,
+            devices,
             config,
             in_flight: None,
             stopping: false,
@@ -98,9 +100,9 @@ impl ThermostatActor {
     /// Switches the given heaters off in the current span. Resolves to the heaters that could
     /// not be switched.
     fn switch_off(&self, heaters: Vec<Heater>) -> impl Future<Output = Vec<Heater>> + 'static {
-        let tapo = self.tapo.clone();
+        let devices = self.devices.clone();
 
-        async move { Self::switch_heaters(&tapo, heaters, false).await }
+        async move { Self::switch_heaters(&devices, heaters, false).await }
             .instrument(tracing::Span::current())
     }
 
@@ -110,7 +112,7 @@ impl ThermostatActor {
     /// is a normal `Off` decision and a plug that could not be switched is retried next tick.
     async fn evaluate(
         coordinator_actor_addr: Addr<CoordinatorActor>,
-        tapo: Tapo,
+        devices: Devices,
         config: Thermostat,
     ) {
         let span = tracing::Span::current();
@@ -119,7 +121,7 @@ impl ThermostatActor {
         // The two inputs are independent, so they are fetched together.
         let (reading, presence) = tokio::join!(
             Self::query_reading(&coordinator_actor_addr, &config),
-            Self::query_presence(&tapo, &config, now),
+            Self::query_presence(&devices, &config, now),
         );
 
         if let Ok(person_detected) = presence {
@@ -142,17 +144,17 @@ impl ThermostatActor {
             HeaterCommand::Keep => return,
         };
 
-        Self::switch_heaters(&tapo, config.heaters, on).await;
+        Self::switch_heaters(&devices, config.heaters, on).await;
     }
 
     /// The heaters are independent, so they are switched together: the time taken is that of
     /// the slowest plug rather than the sum, which matters for the tick deadline and even more
     /// for the shutdown budget. Returns the heaters that could not be switched.
-    async fn switch_heaters(tapo: &Tapo, heaters: Vec<Heater>, on: bool) -> Vec<Heater> {
+    async fn switch_heaters(devices: &Devices, heaters: Vec<Heater>, on: bool) -> Vec<Heater> {
         let switched = join_all(
             heaters
                 .iter()
-                .map(|heater| Self::switch_heater(tapo, heater, on)),
+                .map(|heater| Self::switch_heater(devices, heater, on)),
         )
         .await;
 
@@ -187,11 +189,21 @@ impl ThermostatActor {
     #[instrument(name = "ThermostatActor::query_presence", skip_all, fields(
         camera.ip_address = %config.camera_ip_address,
     ))]
-    async fn query_presence(tapo: &Tapo, config: &Thermostat, now: DateTime<Utc>) -> Presence {
+    async fn query_presence(
+        devices: &Devices,
+        config: &Thermostat,
+        now: DateTime<Utc>,
+    ) -> Presence {
         let window_start = now - chrono::Duration::seconds(config.presence_window_s as i64);
 
+        // The camera is only ever queried here, and a tick cancels the previous one, so it has
+        // no session to share.
         let result = async {
-            let handler = tapo.client().c120(config.camera_ip_address.clone()).await?;
+            let handler = devices
+                .config()
+                .client()
+                .c120(config.camera_ip_address.clone())
+                .await?;
 
             handler.get_detections(window_start, now).await
         }
@@ -218,17 +230,20 @@ impl ThermostatActor {
         heater.ip_address = %heater.ip_address,
         heater.on = on,
     ))]
-    async fn switch_heater(tapo: &Tapo, heater: &Heater, on: bool) -> bool {
-        let result = async {
-            let handler = tapo.client().p110(heater.ip_address.clone()).await?;
-
-            if on {
-                handler.on().await
-            } else {
-                handler.off().await
-            }
-        }
-        .await;
+    async fn switch_heater(devices: &Devices, heater: &Heater, on: bool) -> bool {
+        let result = devices
+            .run(
+                DeviceType::PlugEnergyMonitoring,
+                &heater.ip_address,
+                |handler| {
+                    if on {
+                        handler.on().boxed_local()
+                    } else {
+                        handler.off().boxed_local()
+                    }
+                },
+            )
+            .await;
 
         match result {
             Ok(()) => {
@@ -392,7 +407,7 @@ impl Handler<EvaluateMessage> for ThermostatActor {
 
         let fut = Self::evaluate(
             self.coordinator_actor_addr.clone(),
-            self.tapo.clone(),
+            self.devices.clone(),
             self.config.clone(),
         )
         .instrument(span.clone())

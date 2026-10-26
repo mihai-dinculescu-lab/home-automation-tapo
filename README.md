@@ -40,6 +40,12 @@ Both `/device` endpoints respond with `{ "ip_address": "192.168.1.100", "state":
 
 `device_type` selects the Tapo handler used to talk to the device.
 
+Every device has a single session, shared by the API, the usage polling and the thermostat, and one request runs
+on it at a time: a Tapo device keeps one session, and a login while another request is in progress fails both.
+The session is kept between requests. One that the device no longer accepts, because it expired or a cancelled
+request left it out of step, is reopened and the request retried once; any other failure drops it, so that the
+next request logs in afresh.
+
 | `device_type`            | Devices          |
 | ------------------------ | ---------------- |
 | `light`                  | L510, L520, L610 |

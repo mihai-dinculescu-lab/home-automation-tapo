@@ -1,14 +1,16 @@
 use std::time::Duration;
 
 use actix::{
-    Actor, ActorContext, Addr, AsyncContext, Context, Handler, WrapFuture, clock::interval,
+    Actor, ActorContext, ActorFutureExt, Addr, AsyncContext, Context, Handler, WrapFuture,
+    clock::interval,
 };
-use tapo::ApiClient;
-use tracing::{Instrument, instrument};
+use futures_util::FutureExt as _;
+use tracing::{Instrument, instrument, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::{
-    settings::{Device, Tapo},
+    settings::Device,
+    system::devices::{DeviceType, Devices},
     system::messages::{DeviceUsageMessage, GetDeviceDataMessage, StopMessage},
     telemetry::{consumer_span, producer_span, record_error},
 };
@@ -18,8 +20,12 @@ use super::coordinator_actor::CoordinatorActor;
 #[derive(Debug)]
 pub struct DeviceActor {
     coordinator_actor_addr: Addr<CoordinatorActor>,
-    config: Tapo,
+    devices: Devices,
     device: Device,
+    /// Set while a usage poll is running. A tick that lands meanwhile is skipped rather than
+    /// queued behind it, so that a plug that answers slowly gets one poll at a time instead of
+    /// a backlog.
+    polling: bool,
 }
 
 impl DeviceActor {
@@ -29,13 +35,14 @@ impl DeviceActor {
     ))]
     pub fn new(
         coordinator_actor_addr: Addr<CoordinatorActor>,
-        config: Tapo,
+        devices: Devices,
         device: Device,
     ) -> Self {
         Self {
             coordinator_actor_addr,
-            config,
+            devices,
             device,
+            polling: false,
         }
     }
 
@@ -45,19 +52,18 @@ impl DeviceActor {
     ))]
     async fn query_device_usage(
         device: Device,
-        client: ApiClient,
+        devices: Devices,
         coordinator_actor_addr: Addr<CoordinatorActor>,
     ) {
         let span = tracing::Span::current();
 
-        let result = async {
-            let handler = client.p110(device.ip_address.clone()).await?;
-
-            let device_usage = handler.get_device_usage().await?;
-
-            Ok::<_, tapo::Error>(device_usage)
-        }
-        .await;
+        let result = devices
+            .run(
+                DeviceType::PlugEnergyMonitoring,
+                &device.ip_address,
+                |handler| handler.device_usage().boxed_local(),
+            )
+            .await;
 
         match result {
             Ok(device_usage) => {
@@ -85,7 +91,7 @@ impl Actor for DeviceActor {
     ))]
     fn started(&mut self, ctx: &mut Self::Context) {
         let addr = ctx.address();
-        let refresh_rate = Duration::from_secs(self.config.refresh_rate_s);
+        let refresh_rate = Duration::from_secs(self.devices.config().refresh_rate_s);
 
         let device = self.device.clone();
 
@@ -144,13 +150,21 @@ impl Handler<GetDeviceDataMessage> for DeviceActor {
         );
         let _enter = span.enter();
 
+        if self.polling {
+            warn!("The previous usage poll is still running, skipping this tick");
+            return;
+        }
+
+        self.polling = true;
+
         let device = self.device.clone();
-        let client = self.config.client();
+        let devices = self.devices.clone();
         let coordinator_actor_addr = self.coordinator_actor_addr.clone();
 
-        let fut = Self::query_device_usage(device, client, coordinator_actor_addr)
+        let fut = Self::query_device_usage(device, devices, coordinator_actor_addr)
             .instrument(span.clone())
-            .into_actor(self);
+            .into_actor(self)
+            .map(|_, act, _| act.polling = false);
 
         ctx.spawn(fut);
     }

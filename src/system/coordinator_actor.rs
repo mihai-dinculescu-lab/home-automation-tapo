@@ -15,6 +15,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::settings::{Mqtt, Settings};
 use crate::system::api::api_actor::ApiActor;
 use crate::system::device_actor::DeviceActor;
+use crate::system::devices::Devices;
 use crate::system::messages::{
     DeviceUsageMessage, GetSensorReadingMessage, HealthCheckMessage, SensorReading, StopMessage,
 };
@@ -26,6 +27,8 @@ use crate::telemetry::{consumer_span, producer_span, record_error};
 #[derive(Debug)]
 pub struct CoordinatorActor {
     settings: Settings,
+    /// Shared by every actor that talks to a device, so that each device has a single session.
+    devices: Devices,
     api_actor_addr: Addr<ApiActor>,
     mqtt_actor_addr: Addr<MqttActor>,
     /// `None` when `mqtt.sensors` is missing or disabled.
@@ -46,11 +49,14 @@ impl CoordinatorActor {
         let mqtt_sensors_actor_addr = start_mqtt_sensors_actor(&settings.mqtt)
             .context("Failed to create the MQTT sensors actor")?;
 
-        let api_actor = ApiActor::new(settings.api.clone(), settings.tapo.clone());
+        let devices = Devices::new(settings.tapo.clone());
+
+        let api_actor = ApiActor::new(settings.api.clone(), devices.clone());
         let api_actor_addr = api_actor.start();
 
         Ok(Self {
             settings,
+            devices,
             api_actor_addr,
             mqtt_actor_addr,
             mqtt_sensors_actor_addr,
@@ -122,7 +128,7 @@ impl Handler<HealthCheckMessage> for CoordinatorActor {
         // check api
         if !self.api_actor_addr.connected() {
             warn!("API Actor is not connected, restarting...");
-            let api_actor = ApiActor::new(self.settings.api.clone(), self.settings.tapo.clone());
+            let api_actor = ApiActor::new(self.settings.api.clone(), self.devices.clone());
             self.api_actor_addr = api_actor.start();
         }
 
@@ -166,8 +172,7 @@ impl Handler<HealthCheckMessage> for CoordinatorActor {
             }
 
             // device actor hasn't been created yet or has died -> (re)create
-            let device_actor =
-                DeviceActor::new(addr.clone(), self.settings.tapo.clone(), device.clone());
+            let device_actor = DeviceActor::new(addr.clone(), self.devices.clone(), device.clone());
             let device_actor_addr = device_actor.start();
 
             self.device_actors
@@ -194,7 +199,7 @@ impl Handler<HealthCheckMessage> for CoordinatorActor {
 
             // thermostat actor hasn't been created yet or has died -> (re)create
             let thermostat_actor =
-                ThermostatActor::new(addr.clone(), self.settings.tapo.clone(), thermostat.clone());
+                ThermostatActor::new(addr.clone(), self.devices.clone(), thermostat.clone());
             let thermostat_actor_addr = thermostat_actor.start();
 
             self.thermostat_actors
@@ -220,16 +225,18 @@ impl Handler<StopMessage> for CoordinatorActor {
         let mqtt_actor_addr = self.mqtt_actor_addr.clone();
         let mqtt_sensors_actor_addr = self.mqtt_sensors_actor_addr.take();
 
-        // The thermostats go first so that they stop reading the sensors through the
-        // coordinator, and together, since each one switches its heaters off on the way out;
-        // then the device actors so that usage they have already queued can still be published.
-        // The API, MQTT and sensors drains overlap to stay inside the shutdown timeout.
+        // The device actors go first: stopping one drops the poll it has in flight, which frees
+        // the plug for the thermostat about to switch it off, and the usage they have already
+        // queued can still be published. The thermostats go next, before the sensors they read
+        // through the coordinator are gone, and together, since each one switches its heaters
+        // off on the way out. The API, MQTT and sensors drains overlap to stay inside the
+        // shutdown timeout.
         Box::pin(
             async move {
-                join_all(thermostat_actors.into_iter().map(stop_actor)).await;
                 for device_actor in device_actors {
                     stop_actor(device_actor).await;
                 }
+                join_all(thermostat_actors.into_iter().map(stop_actor)).await;
                 tokio::join!(
                     stop_actor(api_actor_addr),
                     stop_actor(mqtt_actor_addr),

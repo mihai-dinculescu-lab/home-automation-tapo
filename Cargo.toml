@@ -30,7 +30,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # Pinned to main for `CameraHandler::get_detections`; swap back to the crate at 0.13.0 or 0.12.1.
 tapo = { git = "https://github.com/mihai-dinculescu/tapo", rev = "02918745a0de5b323d7282098dcc8442d2189b41" }
-tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "signal", "time"] }
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
 tracing = { version = "0.1", features = ["attributes"] }
 tracing-actix-web = "0.7"
 tracing-log = "0.2"
