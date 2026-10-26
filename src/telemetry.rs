@@ -28,8 +28,9 @@ pub fn set_parent_context(span: &Span, cx: opentelemetry::Context) {
 /// current span, or in `parent` if given.
 ///
 /// The fmt layer prints the event to stdout. The OpenTelemetry layer sets the span status to
-/// ERROR with the error text as description, and turns the event into an `exception` event
-/// carrying the text, the Rust type of the error and its chain of causes.
+/// ERROR with the error text as description, and turns the event into an `exception` span event
+/// carrying `exception.message` (the error text), `exception.type` (the Rust type of the error)
+/// and `exception.stacktrace` (its `Debug` representation, which includes the causes).
 // Two arms rather than an optional `parent:` prefix: `parent` can also start an expression, so a
 // single arm is ambiguous to `macro_rules!`.
 macro_rules! record_error {
@@ -39,7 +40,7 @@ macro_rules! record_error {
             parent: $span,
             error = %e,
             exception.type = $crate::telemetry::error_type(e),
-            exception.stacktrace = $crate::telemetry::error_chain(e).as_deref(),
+            exception.stacktrace = ?e,
         );
     }};
     ($e:expr) => {{
@@ -47,7 +48,7 @@ macro_rules! record_error {
         ::tracing::error!(
             error = %e,
             exception.type = $crate::telemetry::error_type(e),
-            exception.stacktrace = $crate::telemetry::error_chain(e).as_deref(),
+            exception.stacktrace = ?e,
         );
     }};
 }
@@ -56,20 +57,6 @@ pub(crate) use record_error;
 #[doc(hidden)]
 pub(crate) fn error_type<E: Error>(_: &E) -> &'static str {
     std::any::type_name::<E>()
-}
-
-/// The messages of the error's sources, outermost first, or `None` if it has no source.
-#[doc(hidden)]
-pub(crate) fn error_chain<E: Error>(e: &E) -> Option<String> {
-    let mut causes = Vec::new();
-    let mut source = e.source();
-
-    while let Some(cause) = source {
-        causes.push(cause.to_string());
-        source = cause.source();
-    }
-
-    (!causes.is_empty()).then(|| causes.join(": "))
 }
 
 /// Span for a message exchanged between actors. Internal to the `producer_span!` and
