@@ -5,17 +5,20 @@ use actix::clock::{interval, sleep};
 use actix::dev::ToEnvelope;
 use actix::{
     Actor, ActorContext, ActorFutureExt, Addr, AsyncContext, Context, Handler, ResponseActFuture,
-    WrapFuture,
+    ResponseFuture, WrapFuture,
 };
 use anyhow::Context as _;
-use tracing::{info, instrument, warn};
+use tracing::{Instrument, info, instrument, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-use crate::settings::Settings;
+use crate::settings::{Mqtt, Settings};
 use crate::system::api::api_actor::ApiActor;
 use crate::system::device_actor::DeviceActor;
-use crate::system::messages::{DeviceUsageMessage, HealthCheckMessage, StopMessage};
+use crate::system::messages::{
+    DeviceUsageMessage, GetSensorReadingMessage, HealthCheckMessage, SensorReading, StopMessage,
+};
 use crate::system::mqtt_actor::MqttActor;
+use crate::system::mqtt_sensors_actor::MqttSensorsActor;
 use crate::telemetry::{consumer_span, producer_span, record_error};
 
 #[derive(Debug)]
@@ -23,6 +26,8 @@ pub struct CoordinatorActor {
     settings: Settings,
     api_actor_addr: Addr<ApiActor>,
     mqtt_actor_addr: Addr<MqttActor>,
+    /// `None` when `mqtt.sensors` is missing or disabled.
+    mqtt_sensors_actor_addr: Option<Addr<MqttSensorsActor>>,
     device_actors: HashMap<String, Addr<DeviceActor>>,
     shutting_down: bool,
 }
@@ -30,10 +35,13 @@ pub struct CoordinatorActor {
 impl CoordinatorActor {
     #[instrument(name = "CoordinatorActor::new", skip_all)]
     pub fn new(settings: Settings) -> anyhow::Result<Self> {
-        let mqtt_actor = MqttActor::new(settings.mqtt.clone())
-            .inspect_err(|e| record_error!(e))
-            .context("Failed to create the MQTT actor")?;
+        // The actor constructors record their own errors.
+        let mqtt_actor =
+            MqttActor::new(settings.mqtt.clone()).context("Failed to create the MQTT actor")?;
         let mqtt_actor_addr = mqtt_actor.start();
+
+        let mqtt_sensors_actor_addr = start_mqtt_sensors_actor(&settings.mqtt)
+            .context("Failed to create the MQTT sensors actor")?;
 
         let api_actor = ApiActor::new(settings.api.clone(), settings.tapo.clone());
         let api_actor_addr = api_actor.start();
@@ -42,6 +50,7 @@ impl CoordinatorActor {
             settings,
             api_actor_addr,
             mqtt_actor_addr,
+            mqtt_sensors_actor_addr,
             device_actors: HashMap::new(),
             shutting_down: false,
         })
@@ -116,10 +125,20 @@ impl Handler<HealthCheckMessage> for CoordinatorActor {
         // check mqtt
         if !self.mqtt_actor_addr.connected() {
             warn!("MQTT Actor is not connected, restarting...");
-            // retried on the next tick
-            match MqttActor::new(self.settings.mqtt.clone()) {
-                Ok(mqtt_actor) => self.mqtt_actor_addr = mqtt_actor.start(),
-                Err(e) => record_error!(&e),
+            // A failure is recorded by `MqttActor::new` and retried on the next tick.
+            if let Ok(mqtt_actor) = MqttActor::new(self.settings.mqtt.clone()) {
+                self.mqtt_actor_addr = mqtt_actor.start();
+            }
+        }
+
+        // check sensors
+        if let Some(mqtt_sensors_actor_addr) = &self.mqtt_sensors_actor_addr
+            && !mqtt_sensors_actor_addr.connected()
+        {
+            warn!("MQTT Sensors Actor is not connected, restarting...");
+            // A failure is recorded by `MqttSensorsActor::new` and retried on the next tick.
+            if let Ok(addr) = start_mqtt_sensors_actor(&self.settings.mqtt) {
+                self.mqtt_sensors_actor_addr = addr;
             }
         }
 
@@ -163,20 +182,42 @@ impl Handler<StopMessage> for CoordinatorActor {
         let device_actors: Vec<_> = self.device_actors.drain().map(|(_, addr)| addr).collect();
         let api_actor_addr = self.api_actor_addr.clone();
         let mqtt_actor_addr = self.mqtt_actor_addr.clone();
+        let mqtt_sensors_actor_addr = self.mqtt_sensors_actor_addr.take();
 
         // The device actors go first so that usage they have already queued can still be
-        // published. The API and MQTT drains overlap to stay inside the shutdown timeout.
+        // published. The API, MQTT and sensors drains overlap to stay inside the shutdown timeout.
         Box::pin(
             async move {
                 for device_actor in device_actors {
                     stop_actor(device_actor).await;
                 }
-                tokio::join!(stop_actor(api_actor_addr), stop_actor(mqtt_actor_addr));
+                tokio::join!(
+                    stop_actor(api_actor_addr),
+                    stop_actor(mqtt_actor_addr),
+                    async {
+                        if let Some(mqtt_sensors_actor_addr) = mqtt_sensors_actor_addr {
+                            stop_actor(mqtt_sensors_actor_addr).await;
+                        }
+                    }
+                );
             }
             .into_actor(self)
             .map(|_, _, ctx| ctx.stop()),
         )
     }
+}
+
+/// Starts a `MqttSensorsActor` when `mqtt.sensors` is present and enabled.
+fn start_mqtt_sensors_actor(
+    mqtt: &Mqtt,
+) -> Result<Option<Addr<MqttSensorsActor>>, paho_mqtt::Error> {
+    let Some(sensors) = mqtt.sensors.clone().filter(|sensors| sensors.enabled) else {
+        return Ok(None);
+    };
+
+    let actor = MqttSensorsActor::new(mqtt.address.clone(), sensors)?;
+
+    Ok(Some(actor.start()))
 }
 
 /// Sends `StopMessage` and waits until the actor's mailbox is gone, i.e. `stopped()` has run.
@@ -218,5 +259,47 @@ impl Handler<DeviceUsageMessage> for CoordinatorActor {
         if let Err(e) = result {
             record_error!(&e);
         }
+    }
+}
+
+impl Handler<GetSensorReadingMessage> for CoordinatorActor {
+    type Result = ResponseFuture<Option<SensorReading>>;
+
+    /// Forwarded to whichever sensors actor is current, so that a restarted sensors actor is picked
+    /// up without re-wiring the callers. `None` when the sensors are disabled.
+    fn handle(&mut self, message: GetSensorReadingMessage, _: &mut Context<Self>) -> Self::Result {
+        let span = consumer_span!(
+            name = "CoordinatorActor::Handler<GetSensorReadingMessage>",
+            message = GetSensorReadingMessage,
+            parent = message.span_context,
+            destination = "CoordinatorActor",
+            sensor.location = %message.location,
+        );
+        let _enter = span.enter();
+
+        let Some(mqtt_sensors_actor_addr) = self.mqtt_sensors_actor_addr.clone() else {
+            return Box::pin(async { None });
+        };
+
+        let message = GetSensorReadingMessage {
+            span_context: span.context(),
+            location: message.location,
+        };
+
+        Box::pin(
+            async move {
+                match mqtt_sensors_actor_addr.send(message).await {
+                    Ok(reading) => reading,
+                    // Without a send timeout the only error is a closed mailbox: the sensors
+                    // actor is stopping, either for a shutdown or because it has failed; the
+                    // latter has already been reported and the health check recreates it.
+                    Err(_) => {
+                        warn!("MQTT Sensors Actor is gone, no sensor reading");
+                        None
+                    }
+                }
+            }
+            .instrument(span.clone()),
+        )
     }
 }

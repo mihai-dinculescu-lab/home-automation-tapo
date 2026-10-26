@@ -11,6 +11,7 @@ Actor System consisting of:
 - Coordinator Actor - makes sure that everything is running as expected
 - Device Actor - reads the device usage and sends it to the Coordinator Actor, which forwards it to the MQTT Actor
 - MQTT Actor - publishes the data to the MQTT broker
+- MQTT Sensors Actor - subscribes to the sensor readings on the MQTT broker and keeps the latest one per location (only when `mqtt.sensors` is enabled)
 - API Actor - REST API for turning devices on/off and getting their status
 
 ## Usage
@@ -45,6 +46,13 @@ Both `/device` endpoints respond with `{ "ip_address": "192.168.1.100", "state":
 | `rgbic_light_strip`      | L920, L930       |
 | `plug`                   | P100, P105       |
 | `plug_energy_monitoring` | P110, P115       |
+
+## Sensors
+
+When `mqtt.sensors` is present and `enabled`, the service subscribes to the MQTT topic filter `mqtt.sensors.topic_name`
+(e.g. `sensors/#`) and keeps the latest reading per `location` from JSON payloads with at least
+`{"location": "Living Room", "temperature": 21.4}`. The messages are not retained, so readings are only known from the
+moment the service subscribes. `mqtt.sensors` is optional; leaving it out or setting `enabled: false` skips the subscription.
 
 ## Telemetry
 

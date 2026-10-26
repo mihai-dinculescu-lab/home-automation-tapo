@@ -1257,6 +1257,7 @@ dependencies = [
  "actix-rt",
  "actix-web",
  "anyhow",
+ "chrono",
  "config",
  "derive_more",
  "opentelemetry",

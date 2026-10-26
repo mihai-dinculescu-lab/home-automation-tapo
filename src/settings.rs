@@ -17,6 +17,15 @@ pub struct Tapo {
 pub struct Mqtt {
     pub address: String,
     pub topic_name: String,
+    /// Optional; the sensor readings are only read when present and enabled.
+    pub sensors: Option<Sensors>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Sensors {
+    pub enabled: bool,
+    /// Topic filter the sensor readings are received on, e.g. `sensors/#`.
+    pub topic_name: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

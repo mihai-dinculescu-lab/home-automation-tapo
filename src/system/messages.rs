@@ -1,4 +1,5 @@
 use actix::Message;
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tapo::responses::DeviceUsageEnergyMonitoringResult;
 
@@ -19,6 +20,22 @@ pub struct GetDeviceDataMessage {
 #[derive(Debug, Message)]
 #[rtype(result = "()")]
 pub struct StopMessage;
+
+/// The latest reading received from a sensor over MQTT.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SensorReading {
+    pub location: String,
+    pub temperature: f64,
+    /// When the reading was received, not when the sensor took it; the payload carries no timestamp.
+    pub received_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Message)]
+#[rtype(result = "Option<SensorReading>")]
+pub struct GetSensorReadingMessage {
+    pub span_context: opentelemetry::Context,
+    pub location: String,
+}
 
 #[derive(Debug, Message)]
 #[rtype(result = "()")]

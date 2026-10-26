@@ -10,6 +10,11 @@ mqtt:
   # tcp://host:port
   address:
   topic_name:
+  # optional, the sensor readings the thermostats use
+  sensors:
+    enabled:
+    # topic filter the sensor readings are received on, e.g. `sensors/#`
+    topic_name:
 devices:
   - name:
     ip_address:
