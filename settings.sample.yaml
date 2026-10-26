@@ -20,3 +20,26 @@ devices:
     ip_address:
     # set to `false` for plugs that are always on and the time usage becomes irrelevant
     record_time_usage:
+# optional, an empty or missing list disables the thermostat
+thermostats:
+  - name:
+    # a disabled thermostat is not started and leaves its heaters alone
+    enabled:
+    # camera whose person detections decide presence
+    camera_ip_address:
+    # matches the `location` field of the sensor payload
+    sensor_location:
+    # P110 plugs switched together
+    heaters:
+      - name:
+        ip_address:
+    # target in °C
+    target_temperature:
+    # half-width of the band around the target in which the heaters are left as they are
+    deadband:
+    # a person detected this many seconds ago still counts as present, at least interval_s and at most 86400 (24 hours)
+    presence_window_s:
+    # a reading older than this many seconds is treated as missing, at most 86400 (24 hours)
+    reading_max_age_s:
+    # how often the thermostat is evaluated, in seconds
+    interval_s:

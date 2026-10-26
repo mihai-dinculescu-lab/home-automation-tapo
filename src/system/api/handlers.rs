@@ -1,7 +1,6 @@
 use actix_web::http::StatusCode;
 use actix_web::{HttpResponse, web};
 use serde::{Deserialize, Serialize};
-use tapo::ApiClient;
 use tracing::{instrument, warn};
 
 use crate::settings::Tapo;
@@ -58,7 +57,7 @@ pub async fn get_device(
     config: web::Data<Tapo>,
     device: web::Json<GetDevicePayload>,
 ) -> Result<HttpResponse, ApiError> {
-    let client = ApiClient::new(config.username.clone(), config.password.clone());
+    let client = config.client();
     let handler = DeviceHandler::new(client, device.device_type, device.ip_address.clone())
         .await
         .map_err(|e| {
@@ -89,7 +88,7 @@ pub async fn set_device(
     config: web::Data<Tapo>,
     device: web::Json<SetDevicePayload>,
 ) -> Result<HttpResponse, ApiError> {
-    let client = ApiClient::new(config.username.clone(), config.password.clone());
+    let client = config.client();
     let handler = DeviceHandler::new(client, device.device_type, device.ip_address.clone())
         .await
         .map_err(|e| {

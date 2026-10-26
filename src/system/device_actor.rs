@@ -45,14 +45,12 @@ impl DeviceActor {
     ))]
     async fn query_device_usage(
         device: Device,
-        tapo_username: String,
-        tapo_password: String,
+        client: ApiClient,
         coordinator_actor_addr: Addr<CoordinatorActor>,
     ) {
         let span = tracing::Span::current();
 
         let result = async {
-            let client = ApiClient::new(tapo_username, tapo_password);
             let handler = client.p110(device.ip_address.clone()).await?;
 
             let device_usage = handler.get_device_usage().await?;
@@ -147,14 +145,12 @@ impl Handler<GetDeviceDataMessage> for DeviceActor {
         let _enter = span.enter();
 
         let device = self.device.clone();
-        let tapo_username = self.config.username.clone();
-        let tapo_password = self.config.password.clone();
+        let client = self.config.client();
         let coordinator_actor_addr = self.coordinator_actor_addr.clone();
 
-        let fut =
-            Self::query_device_usage(device, tapo_username, tapo_password, coordinator_actor_addr)
-                .instrument(span.clone())
-                .into_actor(self);
+        let fut = Self::query_device_usage(device, client, coordinator_actor_addr)
+            .instrument(span.clone())
+            .into_actor(self);
 
         ctx.spawn(fut);
     }

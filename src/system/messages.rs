@@ -21,6 +21,12 @@ pub struct GetDeviceDataMessage {
 #[rtype(result = "()")]
 pub struct StopMessage;
 
+#[derive(Debug, Message)]
+#[rtype(result = "()")]
+pub struct EvaluateMessage {
+    pub span_context: opentelemetry::Context,
+}
+
 /// The latest reading received from a sensor over MQTT.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SensorReading {

@@ -8,6 +8,7 @@ use actix::{
     ResponseFuture, WrapFuture,
 };
 use anyhow::Context as _;
+use futures_util::future::join_all;
 use tracing::{Instrument, info, instrument, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -19,6 +20,7 @@ use crate::system::messages::{
 };
 use crate::system::mqtt_actor::MqttActor;
 use crate::system::mqtt_sensors_actor::MqttSensorsActor;
+use crate::system::thermostat::thermostat_actor::ThermostatActor;
 use crate::telemetry::{consumer_span, producer_span, record_error};
 
 #[derive(Debug)]
@@ -29,6 +31,7 @@ pub struct CoordinatorActor {
     /// `None` when `mqtt.sensors` is missing or disabled.
     mqtt_sensors_actor_addr: Option<Addr<MqttSensorsActor>>,
     device_actors: HashMap<String, Addr<DeviceActor>>,
+    thermostat_actors: HashMap<String, Addr<ThermostatActor>>,
     shutting_down: bool,
 }
 
@@ -52,6 +55,7 @@ impl CoordinatorActor {
             mqtt_actor_addr,
             mqtt_sensors_actor_addr,
             device_actors: HashMap::new(),
+            thermostat_actors: HashMap::new(),
             shutting_down: false,
         })
     }
@@ -169,6 +173,33 @@ impl Handler<HealthCheckMessage> for CoordinatorActor {
             self.device_actors
                 .insert(device.ip_address.clone(), device_actor_addr);
         }
+
+        // check thermostats
+        for thermostat in &self.settings.thermostats {
+            if !thermostat.enabled {
+                continue;
+            }
+
+            match self.thermostat_actors.get(&thermostat.name) {
+                Some(thermostat_actor) if thermostat_actor.connected() => continue,
+                Some(_) => warn!(
+                    thermostat.name = thermostat.name,
+                    "Thermostat actor is not connected, restarting...",
+                ),
+                None => info!(
+                    thermostat.name = thermostat.name,
+                    "Thermostat actor not found, creating a new one...",
+                ),
+            }
+
+            // thermostat actor hasn't been created yet or has died -> (re)create
+            let thermostat_actor =
+                ThermostatActor::new(addr.clone(), self.settings.tapo.clone(), thermostat.clone());
+            let thermostat_actor_addr = thermostat_actor.start();
+
+            self.thermostat_actors
+                .insert(thermostat.name.clone(), thermostat_actor_addr);
+        }
     }
 }
 
@@ -179,15 +210,23 @@ impl Handler<StopMessage> for CoordinatorActor {
     fn handle(&mut self, _: StopMessage, _: &mut Context<Self>) -> Self::Result {
         self.shutting_down = true;
 
+        let thermostat_actors: Vec<_> = self
+            .thermostat_actors
+            .drain()
+            .map(|(_, addr)| addr)
+            .collect();
         let device_actors: Vec<_> = self.device_actors.drain().map(|(_, addr)| addr).collect();
         let api_actor_addr = self.api_actor_addr.clone();
         let mqtt_actor_addr = self.mqtt_actor_addr.clone();
         let mqtt_sensors_actor_addr = self.mqtt_sensors_actor_addr.take();
 
-        // The device actors go first so that usage they have already queued can still be
-        // published. The API, MQTT and sensors drains overlap to stay inside the shutdown timeout.
+        // The thermostats go first so that they stop reading the sensors through the
+        // coordinator, and together, since each one switches its heaters off on the way out;
+        // then the device actors so that usage they have already queued can still be published.
+        // The API, MQTT and sensors drains overlap to stay inside the shutdown timeout.
         Box::pin(
             async move {
+                join_all(thermostat_actors.into_iter().map(stop_actor)).await;
                 for device_actor in device_actors {
                     stop_actor(device_actor).await;
                 }
@@ -266,7 +305,7 @@ impl Handler<GetSensorReadingMessage> for CoordinatorActor {
     type Result = ResponseFuture<Option<SensorReading>>;
 
     /// Forwarded to whichever sensors actor is current, so that a restarted sensors actor is picked
-    /// up without re-wiring the callers. `None` when the sensors are disabled.
+    /// up without re-wiring the thermostats. `None` when the sensors are disabled.
     fn handle(&mut self, message: GetSensorReadingMessage, _: &mut Context<Self>) -> Self::Result {
         let span = consumer_span!(
             name = "CoordinatorActor::Handler<GetSensorReadingMessage>",

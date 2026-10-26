@@ -4,7 +4,8 @@
 [![license][license_badge]][license]
 
 Reads the `device_usage` of multiple devices and sends the data through MQTT.
-It also includes an API that can control the devices.
+It also includes an API that can control the devices and a thermostat that switches heater plugs
+based on presence and temperature.
 
 Actor System consisting of:
 
@@ -12,6 +13,7 @@ Actor System consisting of:
 - Device Actor - reads the device usage and sends it to the Coordinator Actor, which forwards it to the MQTT Actor
 - MQTT Actor - publishes the data to the MQTT broker
 - MQTT Sensors Actor - subscribes to the sensor readings on the MQTT broker and keeps the latest one per location (only when `mqtt.sensors` is enabled)
+- Thermostat Actor - decides whether a room should be heated and switches the heater plugs
 - API Actor - REST API for turning devices on/off and getting their status
 
 ## Usage
@@ -53,6 +55,29 @@ When `mqtt.sensors` is present and `enabled`, the service subscribes to the MQTT
 (e.g. `sensors/#`) and keeps the latest reading per `location` from JSON payloads with at least
 `{"location": "Living Room", "temperature": 21.4}`. The messages are not retained, so readings are only known from the
 moment the service subscribes. `mqtt.sensors` is optional; leaving it out or setting `enabled: false` skips the subscription.
+
+## Thermostat
+
+Each enabled entry in `thermostats` is evaluated every `interval_s` seconds. The heaters are turned **on** when a
+person was detected by the camera in the last `presence_window_s` seconds and the latest sensor reading for
+`sensor_location` is under `target_temperature - deadband`. They are turned **off** when nobody was detected,
+the camera cannot be queried, the reading is missing or older than `reading_max_age_s` seconds, or the
+temperature is above `target_temperature + deadband`. In between, the heaters are left as they are so that
+they do not cycle around the setpoint.
+
+`On` and `Off` are asserted on every tick, so a plug switched by hand is corrected within one interval. On shutdown
+the heaters are switched off, so that a service that does not come back cannot leave them running.
+
+The readings are not retained, so none is known right after a start and the heaters are turned off until the first
+one arrives. This also covers plugs left on by a run that crashed.
+
+The readings are the ones kept by the [Sensors](#sensors) subscription, matched on `sensor_location`, so an enabled
+thermostat requires `mqtt.sensors` to be enabled. Person detection is read from the camera's SD card through
+`get_detections`, so it has to be enabled in the Tapo app, and `presence_window_s` is capped at 24 hours by the camera.
+It also has to be at least `interval_s`, otherwise a person detected between two ticks can go unnoticed.
+
+`thermostats` is optional; leaving it out or empty disables the thermostat, and a single entry can be switched off
+with `enabled: false`, which leaves its heaters alone.
 
 ## Telemetry
 

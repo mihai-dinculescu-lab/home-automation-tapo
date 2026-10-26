@@ -4,3 +4,4 @@ mod device_actor;
 mod messages;
 mod mqtt_actor;
 mod mqtt_sensors_actor;
+mod thermostat;

@@ -1260,6 +1260,7 @@ dependencies = [
  "chrono",
  "config",
  "derive_more",
+ "futures-util",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions",
@@ -3123,8 +3124,7 @@ dependencies = [
 [[package]]
 name = "tapo"
 version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97994cfba988c1cb40568258b56dea46cae882bb1ade1af7a29cd6aff55046be"
+source = "git+https://github.com/mihai-dinculescu/tapo?rev=02918745a0de5b323d7282098dcc8442d2189b41#02918745a0de5b323d7282098dcc8442d2189b41"
 dependencies = [
  "aes",
  "anyhow",
