@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use opentelemetry::trace::TracerProvider;
@@ -6,7 +7,9 @@ use opentelemetry::{KeyValue, global};
 use opentelemetry_otlp::SpanExporter;
 use opentelemetry_sdk::{Resource, propagation::TraceContextPropagator, trace::SdkTracerProvider};
 use opentelemetry_semantic_conventions as semconv;
+use tracing::level_filters::LevelFilter;
 use tracing::{Level, Span};
+use tracing_log::AsLog as _;
 use tracing_opentelemetry::{OpenTelemetrySpanExt as _, SetParentError};
 use tracing_subscriber::Registry;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt as _};
@@ -30,7 +33,7 @@ pub fn set_parent_context(span: &Span, cx: opentelemetry::Context) {
 /// The fmt layer prints the event to stdout. The OpenTelemetry layer sets the span status to
 /// ERROR with the error text as description, and turns the event into an `exception` span event
 /// carrying `exception.message` (the error text), `exception.type` (the Rust type of the error)
-/// and `exception.stacktrace` (its `Debug` representation, which includes the causes).
+/// and `exception.stacktrace` (its chain of causes, see `error_stacktrace`).
 // Two arms rather than an optional `parent:` prefix: `parent` can also start an expression, so a
 // single arm is ambiguous to `macro_rules!`.
 macro_rules! record_error {
@@ -40,7 +43,7 @@ macro_rules! record_error {
             parent: $span,
             error = %e,
             exception.type = $crate::telemetry::error_type(e),
-            exception.stacktrace = ?e,
+            exception.stacktrace = %$crate::telemetry::error_stacktrace(e),
         );
     }};
     ($e:expr) => {{
@@ -48,7 +51,7 @@ macro_rules! record_error {
         ::tracing::error!(
             error = %e,
             exception.type = $crate::telemetry::error_type(e),
-            exception.stacktrace = ?e,
+            exception.stacktrace = %$crate::telemetry::error_stacktrace(e),
         );
     }};
 }
@@ -57,6 +60,38 @@ pub(crate) use record_error;
 #[doc(hidden)]
 pub(crate) fn error_type<E: Error>(_: &E) -> &'static str {
     std::any::type_name::<E>()
+}
+
+/// The error followed by its causes, outermost first, laid out like anyhow's `Debug`: the causes
+/// are indented under a `Caused by:` heading and numbered when there is more than one. An error
+/// without a source has no chain to show, so its `Debug` representation is used instead: that
+/// keeps the field populated for errors such as paho's, whose details only appear there.
+#[doc(hidden)]
+pub(crate) fn error_stacktrace<E: Error>(e: &E) -> String {
+    let Some(first) = e.source() else {
+        return format!("{e:?}");
+    };
+
+    let mut causes = vec![first];
+    let mut next = first.source();
+    while let Some(cause) = next {
+        causes.push(cause);
+        next = cause.source();
+    }
+
+    let numbered = causes.len() > 1;
+
+    let mut stacktrace = format!("{e}\n\nCaused by:");
+
+    for (n, cause) in causes.iter().enumerate() {
+        if numbered {
+            let _ = write!(stacktrace, "\n{n: >5}: {cause}");
+        } else {
+            let _ = write!(stacktrace, "\n    {cause}");
+        }
+    }
+
+    stacktrace
 }
 
 /// Span for a message exchanged between actors. Internal to the `producer_span!` and
@@ -184,6 +219,13 @@ pub fn init_telemetry() -> Result<Option<SdkTracerProvider>, Box<dyn Error>> {
         .with(format_layer);
 
     tracing::subscriber::set_global_default(subscriber)?;
+
+    // paho reports through `log`, e.g. when its message stream is full and readings are being
+    // dropped; without the bridge those records go nowhere. Capped at the subscriber's level so
+    // that the records it would discard anyway are rejected by `log` before being converted.
+    tracing_log::LogTracer::builder()
+        .with_max_level(LevelFilter::current().as_log())
+        .init()?;
 
     Ok(tracer_provider)
 }

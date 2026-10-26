@@ -11,7 +11,7 @@ use paho_mqtt::{
     DisconnectOptionsBuilder, Message, QOS_1,
 };
 use serde::Deserialize;
-use tracing::{Instrument, error, info, instrument, warn};
+use tracing::{Instrument, info, instrument, warn};
 
 use crate::{
     settings::Sensors,
@@ -236,10 +236,8 @@ impl Actor for MqttSensorsActor {
 
 impl StreamHandler<Option<Message>> for MqttSensorsActor {
     fn handle(&mut self, item: Option<Message>, _: &mut Context<Self>) {
+        // `None` is a lost connection; paho logs it and reconnects on its own.
         let Some(message) = item else {
-            if !self.stop_requested {
-                warn!("Disconnected from the MQTT broker, waiting for the automatic reconnect...");
-            }
             return;
         };
 
@@ -258,16 +256,8 @@ impl StreamHandler<Option<Message>> for MqttSensorsActor {
         self.store_reading(&message);
     }
 
-    #[instrument(
-        name = "MqttSensorsActor::StreamHandler::finished",
-        level = "error",
-        skip_all
-    )]
-    fn finished(&mut self, ctx: &mut Context<Self>) {
-        // Only happens when the client is gone; the coordinator restarts the actor.
-        error!("The MQTT message stream has ended, stopping...");
-        ctx.stop();
-    }
+    // No `finished`: the stream's sender lives in the client's message callback and the client is
+    // owned by the actor, so the stream can only end once the actor is already gone.
 }
 
 impl Handler<ConnectedMessage> for MqttSensorsActor {
