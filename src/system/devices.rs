@@ -122,7 +122,7 @@ impl DeviceHandler {
         match self {
             Self::PlugEnergyMonitoring(handler) => handler.get_device_usage().await,
             _ => Err(tapo::Error::Other(anyhow::anyhow!(
-                "only a plug_energy_monitoring reports its usage"
+                "Only a plug_energy_monitoring reports its usage"
             ))),
         }
     }
@@ -213,7 +213,12 @@ impl Devices {
         loop {
             let handler = match &*session {
                 Some(handler) if reused => handler,
-                _ => session.insert(self.login(device_type, ip_address).await?),
+                _ => {
+                    // Cleared first, so that a failed login does not leave a session that is
+                    // known to be dead for the next caller to try.
+                    *session = None;
+                    session.insert(self.login(device_type, ip_address).await?)
+                }
             };
 
             match op(handler).await {
@@ -232,14 +237,9 @@ impl Devices {
 
 /// Whether the device turned the session down, as opposed to being unreachable or having
 /// answered the request. A 401, a 403 and the session-timeout codes all come back as
-/// `Unauthorized`; any other HTTP status is the device refusing the request before reading it.
+/// `Unauthorized`.
 fn session_rejected(e: &tapo::Error) -> bool {
-    matches!(
-        e,
-        tapo::Error::Tapo(
-            TapoResponseError::Unauthorized { .. } | TapoResponseError::HttpError { .. }
-        )
-    )
+    matches!(e, tapo::Error::Tapo(TapoResponseError::Unauthorized { .. }))
 }
 
 impl fmt::Debug for Devices {

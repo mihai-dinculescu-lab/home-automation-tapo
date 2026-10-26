@@ -36,7 +36,8 @@ The API listens on the `api.host` and `api.port` from `settings.yaml`.
 | `GET`  | `/device`       | `{ "ip_address": "192.168.1.100", "device_type": "plug" }`                          | Returns the `state` of the device |
 | `POST` | `/device`       | `{ "ip_address": "192.168.1.100", "device_type": "plug", "state": { "on": true } }` | Turns the device on or off        |
 
-Both `/device` endpoints respond with `{ "ip_address": "192.168.1.100", "state": { "on": true } }`.
+Both `/device` endpoints respond with `{ "ip_address": "192.168.1.100", "state": { "on": true } }`. A `POST`
+without `state.on` changes nothing and reports the state the device is in.
 
 `device_type` selects the Tapo handler used to talk to the device.
 
@@ -44,7 +45,8 @@ Every device has a single session, shared by the API, the usage polling and the 
 on it at a time: a Tapo device keeps one session, and a login while another request is in progress fails both.
 The session is kept between requests. One that the device no longer accepts, because it expired or a cancelled
 request left it out of step, is reopened and the request retried once; any other failure drops it, so that the
-next request logs in afresh.
+next request logs in afresh. A session is only reused by requests with the same `device_type`, so a device that
+the service also polls is best addressed as `plug_energy_monitoring`.
 
 | `device_type`            | Devices          |
 | ------------------------ | ---------------- |
@@ -86,9 +88,9 @@ It also has to be at least `interval_s`, otherwise a person detected between two
 in `time_zone` (an IANA name such as `Europe/London`); an `end` before `start` crosses midnight. Outside the period
 nothing is queried: the first tick after the period ends switches the heaters off, the following ticks send no
 command, and only a plug that could not be switched is retried on the next tick. A start outside the period
-switches them off the same way, which covers plugs left on by a run that crashed. The period has to last at least
-`interval_s`, otherwise it can pass between two ticks. `active_period` is optional; without it the thermostat runs
-around the clock.
+switches them off the same way, which covers plugs left on by a run that crashed. Both the period and the rest of
+the day have to last at least `interval_s`, otherwise one of them can pass between two ticks. `active_period` is
+optional; without it the thermostat runs around the clock.
 
 `thermostats` is optional; leaving it out or empty disables the thermostat, and a single entry can be switched off
 with `enabled: false`, which leaves its heaters alone.

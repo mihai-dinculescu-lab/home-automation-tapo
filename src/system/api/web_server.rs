@@ -36,7 +36,7 @@ impl WebServer {
         .disable_signals()
         .shutdown_timeout(5)
         .listen(listener)
-        .context("failed to listen to the API socket")?
+        .context("Failed to listen to the API socket")?
         .run();
 
         Ok(Self { port, server })

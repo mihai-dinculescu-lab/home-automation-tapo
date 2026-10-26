@@ -89,35 +89,40 @@ pub async fn set_device(
 ) -> Result<HttpResponse, ApiError> {
     let on = device.state.on;
 
-    devices
+    let on = devices
         .run(device.device_type, &device.ip_address, move |handler| {
-            match on {
-                Some(true) => handler.on().boxed_local(),
-                Some(false) => handler.off().boxed_local(),
-                // Still logs in, so that an unreachable device is reported.
-                None => async { Ok(()) }.boxed_local(),
+            async move {
+                match on {
+                    Some(true) => handler.on().await.map(|_| true),
+                    Some(false) => handler.off().await.map(|_| false),
+                    // Without a state to set, the device is asked for its state instead, so that
+                    // an unreachable one is still reported.
+                    None => handler.device_on().await,
+                }
             }
+            .boxed_local()
         })
         .await
         .map_err(api_error)?;
 
     let result = DeviceResponse {
         ip_address: device.ip_address.clone(),
-        state: device.state,
+        state: DeviceState { on: Some(on) },
     };
 
     Ok(HttpResponse::Ok().json(result))
 }
 
 /// A failed login is the client's error, e.g. a wrong address, so the request span isn't marked
-/// as failed; a failed request on a device that answered is ours.
+/// as failed. So is a device that cannot be reached on a session already open, since it fails
+/// the same way whether or not a session is cached; anything else a device answered is ours.
 fn api_error(e: DeviceError) -> ApiError {
     match &e {
-        DeviceError::Login(cause) => {
+        DeviceError::Login(cause) | DeviceError::Request(cause @ tapo::Error::Http(_)) => {
             warn!(error = %cause, "Failed to connect to the device");
-            ApiError::BadRequest("failed to connect to the device".to_string())
+            ApiError::BadRequest("Failed to connect to the device".to_string())
         }
-        DeviceError::Request(_) => {
+        _ => {
             record_error!(&e);
             ApiError::InternalServerError
         }

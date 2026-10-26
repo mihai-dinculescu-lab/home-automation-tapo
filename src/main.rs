@@ -7,16 +7,18 @@ use home_automation_tapo::settings::Settings;
 use home_automation_tapo::system::coordinator_actor::CoordinatorActor;
 use home_automation_tapo::telemetry::{init_telemetry, shutdown_telemetry};
 
-// Together these stay within Kubernetes' default 30s termination grace period.
-const ACTORS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
-const TELEMETRY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+// Together these stay within Kubernetes' default 30s termination grace period. The actors get
+// most of it, since the thermostats switch their heaters off on the way out and may have to wait
+// for a slow request on the same plug first.
+const ACTORS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
+const TELEMETRY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[actix_rt::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Registered before anything else so that a signal received during startup isn't lost.
     let shutdown_signal = shutdown_signal();
 
-    let settings = Settings::new().expect("failed to read the settings");
+    let settings = Settings::new().expect("Failed to read the settings");
 
     let tracer_provider = init_telemetry()?;
 

@@ -21,9 +21,11 @@ use crate::{
     telemetry::{consumer_span, producer_span, record_error},
 };
 
-/// Bound on switching the heaters off at a stop. It has to leave room inside the actors'
-/// shutdown timeout in `main` for the other actors to drain after the thermostats.
-const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bound on switching the heaters off at a stop. It covers a wait for a slow request already
+/// running on a plug plus the switch itself, and has to leave room inside the actors' shutdown
+/// timeout in `main` for the other actors to drain after the thermostats, the API's graceful
+/// stop among them.
+const STOP_TIMEOUT: Duration = Duration::from_secs(12);
 
 #[derive(Debug)]
 pub struct ThermostatActor {

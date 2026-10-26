@@ -43,7 +43,7 @@ impl Actor for ApiActor {
         let fut = async move {
             WebServer::new(&host, port, devices)
                 .await
-                .expect("failed to create the API")
+                .expect("Failed to create the API")
         }
         .into_actor(self)
         .map(|web_server, act, ctx| {
@@ -54,7 +54,7 @@ impl Actor for ApiActor {
                     web_server
                         .run_until_stopped()
                         .await
-                        .expect("failed to start the API");
+                        .expect("Failed to start the API");
                 }
                 .into_actor(act),
             );

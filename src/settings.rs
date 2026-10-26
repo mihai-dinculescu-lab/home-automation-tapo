@@ -156,13 +156,13 @@ pub struct Settings {
 
 impl Settings {
     pub fn new() -> Result<Self, anyhow::Error> {
-        let base_path = std::env::current_dir().expect("failed to determine the current directory");
+        let base_path = std::env::current_dir().expect("Failed to determine the current directory");
 
         let mut builder = config::Config::builder();
 
         let config_path = base_path.join("settings.yaml");
         builder = builder.add_source(config::File::new(
-            config_path.to_str().expect("this should never happen"),
+            config_path.to_str().expect("This should never happen"),
             config::FileFormat::Yaml,
         ));
 
@@ -250,10 +250,16 @@ impl Settings {
                     "Thermostat '{name}': active_period.start and active_period.end must differ; \
                      leave active_period out to run around the clock"
                 );
+                let interval = chrono::Duration::seconds(thermostat.interval_s as i64);
                 ensure!(
-                    period.length() >= chrono::Duration::seconds(thermostat.interval_s as i64),
+                    period.length() >= interval,
                     "Thermostat '{name}': active_period must last at least interval_s, otherwise \
                      it can pass between two ticks"
+                );
+                ensure!(
+                    chrono::Duration::days(1) - period.length() >= interval,
+                    "Thermostat '{name}': the time outside active_period must last at least \
+                     interval_s, otherwise no tick switches the heaters off"
                 );
             }
         }
@@ -509,6 +515,30 @@ mod tests {
                 error(&settings).contains("active_period must last at least interval_s"),
                 "period {start}-{end}"
             );
+        }
+    }
+
+    #[test]
+    fn gap_outside_active_period_shorter_than_interval_is_rejected() {
+        // interval_s is 300; the second period crosses midnight.
+        for (start, end) in [("08:04", "08:00"), ("00:02", "23:58")] {
+            let mut settings = settings();
+            settings.thermostats[0].active_period = Some(period(start, end));
+
+            assert!(
+                error(&settings).contains("the time outside active_period must last at least"),
+                "period {start}-{end}"
+            );
+        }
+    }
+
+    #[test]
+    fn gap_outside_active_period_as_long_as_interval_passes() {
+        for (start, end) in [("08:05", "08:00"), ("00:03", "23:58")] {
+            let mut settings = settings();
+            settings.thermostats[0].active_period = Some(period(start, end));
+
+            settings.validate().unwrap();
         }
     }
 
