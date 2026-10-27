@@ -1,3 +1,4 @@
+use std::io;
 use std::net::TcpListener;
 
 use actix::Recipient;
@@ -6,7 +7,6 @@ use actix_web::{
     dev::{Server, ServerHandle},
     web,
 };
-use anyhow::Context;
 use tracing_actix_web::TracingLogger;
 
 use crate::system::{api::handlers, devices::Devices, messages::ProbeMessage};
@@ -23,7 +23,7 @@ impl WebServer {
         port: u16,
         devices: Devices,
         coordinator: Recipient<ProbeMessage>,
-    ) -> Result<Self, anyhow::Error> {
+    ) -> io::Result<Self> {
         let address = format!("{host}:{port}",);
 
         let listener = TcpListener::bind(address)?;
@@ -47,15 +47,14 @@ impl WebServer {
         // The process-level shutdown (main.rs) stops the server via its handle.
         .disable_signals()
         .shutdown_timeout(5)
-        .listen(listener)
-        .context("Failed to listen to the API socket")?
+        .listen(listener)?
         .run();
 
         Ok(Self { port, server })
     }
 
-    pub async fn run_until_stopped(self) -> Result<(), anyhow::Error> {
-        Ok(self.server.await?)
+    pub async fn run_until_stopped(self) -> io::Result<()> {
+        self.server.await
     }
 
     pub fn port(&self) -> u16 {

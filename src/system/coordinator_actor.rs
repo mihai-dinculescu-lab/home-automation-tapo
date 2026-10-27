@@ -246,13 +246,20 @@ impl Handler<StopMessage> for CoordinatorActor {
         let mqtt_actor_addr = self.mqtt_actor_addr.clone();
         let mqtt_sensors_actor_addr = self.mqtt_sensors_actor_addr.take();
 
-        // Nothing has to happen on the way out, so every actor drains at once and the stop takes
-        // as long as the slowest of them: the MQTT publishes in flight or the API's graceful stop.
+        // The thermostats and device actors stop first, since they send the messages that the
+        // others act on: a usage poll that finished meanwhile is then forwarded to the MQTT actor
+        // before it is asked to stop, rather than after it has gone. A poll still running is
+        // cancelled, so its reading is not sent at all. They have nothing to drain,
+        // so the stop still takes as long as the slowest of the rest: the MQTT publishes in
+        // flight or the API's graceful stop.
         Box::pin(
             async move {
                 tokio::join!(
                     join_all(thermostat_actors.into_iter().map(stop_actor)),
                     join_all(device_actors.into_iter().map(stop_actor)),
+                );
+
+                tokio::join!(
                     stop_actor(api_actor_addr),
                     stop_actor(mqtt_actor_addr),
                     async {
@@ -290,6 +297,11 @@ where
     // an error means the actor has already stopped
     let _ = addr.send(StopMessage).await;
 
+    wait_until_stopped(&addr).await;
+}
+
+/// Waits until the actor's mailbox is gone, i.e. `stopped()` has run.
+pub async fn wait_until_stopped<A: Actor>(addr: &Addr<A>) {
     while addr.connected() {
         sleep(Duration::from_millis(10)).await;
     }

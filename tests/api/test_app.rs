@@ -33,6 +33,15 @@ impl Handler<StopMessage> for CoordinatorStub {
     }
 }
 
+/// Devices that are never logged in to; no test talks to a device.
+pub fn devices() -> Devices {
+    Devices::new(Tapo {
+        username: "".to_string(),
+        password: "".to_string(),
+        refresh_rate_s: 60,
+    })
+}
+
 pub struct TestApp {
     pub address: String,
     pub coordinator: Addr<CoordinatorStub>,
@@ -45,22 +54,11 @@ impl TestApp {
     }
 
     pub async fn with_coordinator(coordinator: CoordinatorStub) -> Self {
-        let tapo = Tapo {
-            username: "".to_string(),
-            password: "".to_string(),
-            refresh_rate_s: 60,
-        };
-
         let coordinator = coordinator.start();
 
-        let web_server = WebServer::new(
-            "localhost",
-            0,
-            Devices::new(tapo),
-            coordinator.clone().recipient(),
-        )
-        .await
-        .expect("Failed to build API");
+        let web_server = WebServer::new("localhost", 0, devices(), coordinator.clone().recipient())
+            .await
+            .expect("Failed to build API");
 
         let port = web_server.port();
         tokio::spawn(web_server.run_until_stopped());

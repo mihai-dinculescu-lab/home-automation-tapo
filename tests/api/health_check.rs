@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use home_automation_tapo::system::StopMessage;
 use home_automation_tapo::system::api::handlers::ApiStatusResponse;
+use home_automation_tapo::system::coordinator_actor::wait_until_stopped;
 
 use crate::api::test_app::{CoordinatorStub, TestApp};
 
@@ -40,13 +41,9 @@ async fn health_check_fails_when_the_coordinator_has_stopped() {
         .send(StopMessage)
         .await
         .expect("Failed to stop the coordinator stub");
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while app.coordinator.connected() {
-            actix::clock::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("The coordinator stub did not stop");
+    tokio::time::timeout(Duration::from_secs(1), wait_until_stopped(&app.coordinator))
+        .await
+        .expect("The coordinator stub did not stop");
 
     // Act & Assert
     assert_unavailable(&app).await;
