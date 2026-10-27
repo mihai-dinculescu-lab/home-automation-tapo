@@ -66,12 +66,14 @@ moment the service subscribes. `mqtt.sensors` is optional; leaving it out or set
 
 ## Thermostat
 
-Each enabled entry in `thermostats` is evaluated every `interval_s` seconds. The heaters are turned **on** when a
-person was detected by the camera in the last `presence_window_s` seconds and the latest sensor reading for
-`sensor_location` is under `target_temperature - deadband`. They are turned **off** when nobody was detected,
-the camera cannot be queried, the reading is missing or older than `reading_max_age_s` seconds, or the
-temperature is above `target_temperature + deadband`. In between, the last command is repeated, so that they do
-not cycle around the setpoint; right after a start there is no last command and they are turned off.
+Each enabled entry in `thermostats` is evaluated every `interval_s` seconds under the rule of the active period
+containing the current time. The heaters are turned **on** when a person was detected by the camera in the last
+`presence_window_s` seconds and the latest sensor reading for `sensor_location` is under the period's
+`target_temperature - deadband`. They are turned **off** when nobody was detected, the camera cannot be queried,
+the reading is missing or older than `reading_max_age_s` seconds, or the temperature is above
+`target_temperature + deadband`. In between, the last command is repeated, so that they do not cycle around the
+setpoint; right after a start there is no last command and they are turned off. A period with
+`require_presence: false` skips the camera and heats the room on the reading alone, e.g. before anyone is up.
 
 Every tick commands the heaters, so a plug switched by hand is corrected within one interval. Nothing happens on
 shutdown: the next start asserts the heaters on its first tick.
@@ -84,12 +86,16 @@ thermostat requires `mqtt.sensors` to be enabled. Person detection is read from 
 `get_detections`, so it has to be enabled in the Tapo app, and `presence_window_s` is capped at 24 hours by the camera.
 It also has to be at least `interval_s`, otherwise a person detected between two ticks can go unnoticed.
 
-`active_period` limits a thermostat to part of the day, from `start` (inclusive) to `end` (exclusive) as `HH:MM`
-in `time_zone` (an IANA name such as `Europe/London`); an `end` before `start` crosses midnight. Outside the period
-nothing is queried and the heaters are switched off on every tick, which also covers a start outside the period and
-plugs left on by a run that crashed. Both the period and the rest of the day have to last at least `interval_s`,
-otherwise one of them can pass between two ticks. `active_period` is
-optional; without it the thermostat runs around the clock.
+`active_periods` lists the parts of the day in which a thermostat runs, each from `start` (inclusive) to `end`
+(exclusive) as `HH:MM` in the thermostat's `time_zone` (an IANA name such as `Europe/London`); an `end` before
+`start` crosses midnight. Each period carries its own `target_temperature` and `require_presence`, so a morning
+period can warm the room before anyone is up and the day period can require someone to be there. Outside every
+period nothing is queried and the heaters are switched off on every tick, which also covers a start outside the
+schedule and plugs left on by a run that crashed. The list needs at least one entry; a thermostat that heats all
+day tiles it with abutting periods. The periods may abut but not overlap, each has to last at least `interval_s`,
+and so does any gap between two of them, otherwise a period or a gap can pass between two ticks. These lengths are
+checked on the local clock, so on the two daylight saving nights a period or gap inside the skipped hour gets no
+tick and one inside the repeated hour runs twice; keep the boundaries away from that hour.
 
 `thermostats` is optional; leaving it out or empty disables the thermostat, and a single entry can be switched off
 with `enabled: false`, which leaves its heaters alone.
@@ -106,16 +112,21 @@ met yet and are marked as such.
 2. **A stuck process is replaced within about a minute.** `/health-check` round-trips a probe to the coordinator actor
    on the thread every actor runs on, so a blocked thread or a stopped coordinator fails the Kubernetes liveness probe,
    which restarts the pod. A thermostat actor that has died is recreated by the coordinator within 60 seconds.
-3. **The heaters are off within one interval of the active period ending.** Every tick outside the period switches
-   them off, so a plug that could not be switched is tried again on the next one. Both the period and the rest of the
-   day are validated to last at least `interval_s`, so a tick always lands in each.
+3. **Within one interval of a period ending, the heaters follow the next period's rule, or Off in a gap.** Every
+   tick outside the schedule switches them off, so a plug that could not be switched is tried again on the next one.
+   Every period and every gap between two of them is validated to last at least `interval_s`, so a tick always
+   lands in each.
 4. **Every start asserts Off within seconds, unless fresh inputs say On.** The first tick runs as soon as the actor
-   starts. Outside the period it switches the heaters off; inside it, no reading and no last command are known yet,
+   starts. Outside every period it switches the heaters off; inside one, no reading and no last command are known yet,
    either of which decides Off. This covers plugs left on by a run that crashed, was killed or was stopped.
 5. **Unknown decides Off.** A camera that cannot be queried, nobody present, a missing reading and a stale reading all
-   switch off. On requires a person present and a fresh reading below the band.
+   switch off. On requires a fresh reading below the band, and a person present in any period that requires it. A
+   period with `require_presence: false` is an explicit, logged opt-out, so property 12 still holds.
 6. **Exposure is bounded once a trigger disappears.** After a person leaves or a sensor falls silent, the heaters are
-   off within `presence_window_s` or `reading_max_age_s` plus one interval.
+   off within `presence_window_s` or `reading_max_age_s` plus one interval. Periods that do not require presence
+   are not bounded by the presence window: the heaters can run on the reading alone until the next period that
+   requires presence or the next gap, plus one interval. A schedule in which no period requires presence is bounded
+   by `reading_max_age_s` only.
 7. **No heater stays on without a fresh On, even with the service gone.** Not met yet. Every safeguard above runs in
    the service, so a pod that is gone, cut off from the network or unable to reach a plug leaves the plug as it was.
    The plug's own countdown timer, armed on every On, would close this.
@@ -132,8 +143,10 @@ met yet and are marked as such.
     already mounted, and MQTT or the camera being down decides Off. The image is still pulled on every restart, so a
     registry outage can keep a replacement pod from starting.
 12. **Configuration cannot silently disable safety.** The settings are validated at startup and the service refuses to
-    start on a zero interval, a presence window shorter than the interval, a period or a gap outside it shorter than
-    the interval, a non-finite temperature or deadband, or an enabled thermostat without the sensors.
+    start on a zero interval, a presence window shorter than the interval, a period or a gap between two of them
+    shorter than the interval, overlapping periods, an empty list of periods, a key it does not know in a
+    thermostat, a period or a heater, a non-finite temperature or deadband, or an enabled thermostat without the
+    sensors.
 
 ## Telemetry
 

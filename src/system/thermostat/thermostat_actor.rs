@@ -64,7 +64,9 @@ impl ThermostatActor {
     }
 
     /// Records a decision on the tick's span and in the log, the one place that names its fields.
-    fn record_decision(span: &tracing::Span, name: &str, decision: Decision) {
+    /// The log line carries the target the tick ran under, so that it shows which period's rule
+    /// decided; there is none outside every period.
+    fn record_decision(span: &tracing::Span, name: &str, target: Option<f64>, decision: Decision) {
         span.record(
             "thermostat.command",
             tracing::field::display(decision.command),
@@ -74,8 +76,10 @@ impl ThermostatActor {
             tracing::field::display(decision.reason),
         );
 
+        let target = target.map_or(String::new(), |target| format!(", target {target} °C"));
+
         info!(
-            "Thermostat '{name}': {} ({})",
+            "Thermostat '{name}': {} ({}){target}",
             decision.command, decision.reason
         );
     }
@@ -83,6 +87,9 @@ impl ThermostatActor {
     /// One tick's inputs and decision. The handler switches the heaters once it has remembered
     /// the command, so that a tick cancelled mid-switch still leaves the command it decided for
     /// the deadband to repeat.
+    ///
+    /// Only what the period needs is queried: outside every period nothing is, and inside one
+    /// the camera is only consulted when the period requires presence.
     ///
     /// A camera failure is recorded on the span but does not fail the tick: it is a normal `Off`
     /// decision.
@@ -95,21 +102,29 @@ impl ThermostatActor {
         let span = tracing::Span::current();
         let now = Utc::now();
 
-        // Outside the active period nothing is queried and the heaters are switched off.
-        if !config.is_active(now) {
+        let Some(period) = config.active_period(now) else {
             let decision = Decision::new(HeaterCommand::Off, Reason::OutsideActivePeriod);
-            Self::record_decision(&span, &config.name, decision);
+            Self::record_decision(&span, &config.name, None, decision);
 
             return decision;
-        }
+        };
+
+        span.record("thermostat.target_temperature", period.target_temperature);
+        span.record("thermostat.require_presence", period.require_presence);
 
         // The two inputs are independent, so they are fetched together.
         let (reading, presence) = tokio::join!(
             Self::query_reading(&coordinator_actor_addr, &config),
-            Self::query_presence(&devices, &config, now),
+            async {
+                if period.require_presence {
+                    Some(Self::query_presence(&devices, &config, now).await)
+                } else {
+                    None
+                }
+            },
         );
 
-        if let Ok(person_detected) = presence {
+        if let Some(Ok(person_detected)) = presence {
             span.record("thermostat.person_detected", person_detected);
         }
         if let Some(reading) = &reading {
@@ -121,7 +136,12 @@ impl ThermostatActor {
         }
 
         let decision = decide(now, presence, reading.as_ref(), last_command, &config);
-        Self::record_decision(&span, &config.name, decision);
+        Self::record_decision(
+            &span,
+            &config.name,
+            Some(period.target_temperature),
+            decision,
+        );
 
         decision
     }
@@ -294,6 +314,8 @@ impl Handler<EvaluateMessage> for ThermostatActor {
             parent = message.span_context,
             destination = "ThermostatActor",
             thermostat.name = %self.config.name,
+            thermostat.target_temperature = tracing::field::Empty,
+            thermostat.require_presence = tracing::field::Empty,
             thermostat.person_detected = tracing::field::Empty,
             thermostat.temperature = tracing::field::Empty,
             thermostat.reading_age_s = tracing::field::Empty,

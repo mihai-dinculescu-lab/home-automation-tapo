@@ -18,13 +18,12 @@ pub enum HeaterCommand {
     Off,
 }
 
-/// Why the heaters were commanded. The first one is recorded by the actor rather than by
-/// `decide`, which is only called inside the active period, so that the span's vocabulary stays
-/// in one place.
+/// Why the heaters were commanded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
 pub enum Reason {
-    /// The tick fell outside the active period.
+    /// The tick fell outside every active period.
     OutsideActivePeriod,
+    /// The period requires presence and the camera could not be queried, or was not.
     CameraError,
     NobodyPresent,
     NoReading,
@@ -57,6 +56,13 @@ pub fn person_present(detections: &[DetectionResult], window_start: DateTime<Utc
 
 /// Decides what to do with the heaters. The rules are evaluated in order; the first match wins.
 ///
+/// The rule a tick runs under is the active period containing `now`: it holds the target and
+/// says whether presence is consulted. Outside every period the heaters are turned off.
+///
+/// `presence` is `None` when the camera was not consulted. A period that requires presence
+/// treats that as unknown, which decides off, so that the decision function rather than the
+/// actor encodes when presence matters. A period that does not require presence ignores it.
+///
 /// Every decision is a command, so that each tick asserts the heaters anew and a plug switched
 /// by hand is corrected within one interval. Within the deadband the last command is repeated,
 /// so that the heaters do not cycle around the setpoint; without one, right after a start, they
@@ -66,15 +72,23 @@ pub fn person_present(detections: &[DetectionResult], window_start: DateTime<Utc
 /// known right after a start, and the plugs may have been left on by a run that crashed.
 pub fn decide(
     now: DateTime<Utc>,
-    presence: Presence,
+    presence: Option<Presence>,
     reading: Option<&SensorReading>,
     last_command: Option<HeaterCommand>,
     config: &Thermostat,
 ) -> Decision {
-    match presence {
-        Err(PresenceError) => return Decision::new(HeaterCommand::Off, Reason::CameraError),
-        Ok(false) => return Decision::new(HeaterCommand::Off, Reason::NobodyPresent),
-        Ok(true) => {}
+    let Some(period) = config.active_period(now) else {
+        return Decision::new(HeaterCommand::Off, Reason::OutsideActivePeriod);
+    };
+
+    if period.require_presence {
+        match presence {
+            None | Some(Err(PresenceError)) => {
+                return Decision::new(HeaterCommand::Off, Reason::CameraError);
+            }
+            Some(Ok(false)) => return Decision::new(HeaterCommand::Off, Reason::NobodyPresent),
+            Some(Ok(true)) => {}
+        }
     }
 
     let max_age = Duration::seconds(config.reading_max_age_s as i64);
@@ -87,9 +101,9 @@ pub fn decide(
         return Decision::new(HeaterCommand::Off, Reason::StaleReading);
     }
 
-    if reading.temperature > config.target_temperature + config.deadband {
+    if reading.temperature > period.target_temperature + config.deadband {
         Decision::new(HeaterCommand::Off, Reason::AboveTarget)
-    } else if reading.temperature < config.target_temperature - config.deadband {
+    } else if reading.temperature < period.target_temperature - config.deadband {
         Decision::new(HeaterCommand::On, Reason::BelowTarget)
     } else {
         Decision::new(
@@ -104,16 +118,22 @@ mod tests {
     use chrono::TimeZone;
 
     use super::*;
+    use crate::settings::ActivePeriod;
 
+    fn period(start: &str, end: &str, target_temperature: f64) -> ActivePeriod {
+        ActivePeriod::new(start, end, target_temperature, true)
+    }
+
+    /// A single period that contains `now` and requires presence.
     fn config() -> Thermostat {
         Thermostat {
             name: "Living Room".to_string(),
             enabled: true,
-            active_period: None,
+            time_zone: chrono_tz::Europe::London,
+            active_periods: vec![period("08:00", "22:00", 22.0)],
             camera_ip_address: "192.168.1.154".to_string(),
             sensor_location: "Living Room".to_string(),
             heaters: vec![],
-            target_temperature: 22.0,
             deadband: 0.25,
             presence_window_s: 900,
             reading_max_age_s: 900,
@@ -121,6 +141,7 @@ mod tests {
         }
     }
 
+    /// Noon in London, inside the period of `config`.
     fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 10, 25, 12, 0, 0).unwrap()
     }
@@ -145,10 +166,102 @@ mod tests {
     }
 
     #[test]
+    fn outside_every_period_turns_off() {
+        // 03:00 London, with fresh inputs that would otherwise decide On.
+        let now = Utc.with_ymd_and_hms(2026, 10, 25, 3, 0, 0).unwrap();
+        let reading = SensorReading {
+            location: "Living Room".to_string(),
+            temperature: 20.0,
+            received_at: now,
+        };
+
+        let decision = decide(
+            now,
+            Some(Ok(true)),
+            Some(&reading),
+            Some(HeaterCommand::On),
+            &config(),
+        );
+
+        assert_eq!(
+            decision,
+            Decision::new(HeaterCommand::Off, Reason::OutsideActivePeriod)
+        );
+    }
+
+    #[test]
+    fn period_not_requiring_presence_ignores_it() {
+        let mut config = config();
+        config.active_periods[0].require_presence = false;
+
+        for presence in [None, Some(Err(PresenceError)), Some(Ok(false))] {
+            let decision = decide(
+                now(),
+                presence,
+                Some(&reading(20.0, Duration::zero())),
+                None,
+                &config,
+            );
+
+            assert_eq!(
+                decision,
+                Decision::new(HeaterCommand::On, Reason::BelowTarget),
+                "presence {presence:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn period_requiring_presence_treats_no_presence_as_a_camera_error() {
+        let decision = decide(
+            now(),
+            None,
+            Some(&reading(20.0, Duration::zero())),
+            None,
+            &config(),
+        );
+
+        assert_eq!(
+            decision,
+            Decision::new(HeaterCommand::Off, Reason::CameraError)
+        );
+    }
+
+    #[test]
+    fn target_comes_from_the_period() {
+        // 06:00 London is in the first period, noon in the second; 21.5 °C is below the band
+        // around 22 °C and above the one around 21 °C.
+        let mut config = config();
+        config.active_periods = vec![
+            period("05:45", "07:00", 21.0),
+            period("07:00", "22:00", 22.0),
+        ];
+
+        let decide_at = |now: DateTime<Utc>| {
+            let reading = SensorReading {
+                location: "Living Room".to_string(),
+                temperature: 21.5,
+                received_at: now,
+            };
+
+            decide(now, Some(Ok(true)), Some(&reading), None, &config)
+        };
+
+        assert_eq!(
+            decide_at(Utc.with_ymd_and_hms(2026, 10, 25, 6, 0, 0).unwrap()),
+            Decision::new(HeaterCommand::Off, Reason::AboveTarget)
+        );
+        assert_eq!(
+            decide_at(now()),
+            Decision::new(HeaterCommand::On, Reason::BelowTarget)
+        );
+    }
+
+    #[test]
     fn camera_error_turns_off() {
         let decision = decide(
             now(),
-            Err(PresenceError),
+            Some(Err(PresenceError)),
             Some(&reading(20.0, Duration::zero())),
             None,
             &config(),
@@ -164,7 +277,7 @@ mod tests {
     fn nobody_present_turns_off() {
         let decision = decide(
             now(),
-            Ok(false),
+            Some(Ok(false)),
             Some(&reading(20.0, Duration::zero())),
             None,
             &config(),
@@ -178,7 +291,7 @@ mod tests {
 
     #[test]
     fn no_reading_turns_off() {
-        let decision = decide(now(), Ok(true), None, None, &config());
+        let decision = decide(now(), Some(Ok(true)), None, None, &config());
 
         assert_eq!(
             decision,
@@ -190,7 +303,7 @@ mod tests {
     fn stale_reading_turns_off() {
         let decision = decide(
             now(),
-            Ok(true),
+            Some(Ok(true)),
             Some(&reading(20.0, Duration::seconds(901))),
             None,
             &config(),
@@ -206,7 +319,7 @@ mod tests {
     fn reading_exactly_at_max_age_is_fresh() {
         let decision = decide(
             now(),
-            Ok(true),
+            Some(Ok(true)),
             Some(&reading(20.0, Duration::seconds(900))),
             None,
             &config(),
@@ -222,7 +335,7 @@ mod tests {
     fn above_target_turns_off() {
         let decision = decide(
             now(),
-            Ok(true),
+            Some(Ok(true)),
             Some(&reading(22.3, Duration::zero())),
             Some(HeaterCommand::On),
             &config(),
@@ -238,7 +351,7 @@ mod tests {
     fn below_target_turns_on() {
         let decision = decide(
             now(),
-            Ok(true),
+            Some(Ok(true)),
             Some(&reading(21.7, Duration::zero())),
             Some(HeaterCommand::Off),
             &config(),
@@ -255,7 +368,7 @@ mod tests {
         for last_command in [HeaterCommand::On, HeaterCommand::Off] {
             let decision = decide(
                 now(),
-                Ok(true),
+                Some(Ok(true)),
                 Some(&reading(22.0, Duration::zero())),
                 Some(last_command),
                 &config(),
@@ -273,7 +386,7 @@ mod tests {
     fn within_deadband_without_a_last_command_turns_off() {
         let decision = decide(
             now(),
-            Ok(true),
+            Some(Ok(true)),
             Some(&reading(22.0, Duration::zero())),
             None,
             &config(),
@@ -290,7 +403,7 @@ mod tests {
         for temperature in [21.75, 22.25] {
             let decision = decide(
                 now(),
-                Ok(true),
+                Some(Ok(true)),
                 Some(&reading(temperature, Duration::zero())),
                 Some(HeaterCommand::On),
                 &config(),

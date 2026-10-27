@@ -25,15 +25,22 @@ thermostats:
   - name:
     # a disabled thermostat is not started and leaves its heaters alone
     enabled:
-    # optional, the part of the day in which the thermostat runs; outside it, nothing is queried
-    # and the heaters are switched off on every tick. Leave it out to run around the clock
-    active_period:
+    # IANA name the periods are in, e.g. Europe/London
+    time_zone:
+    # the parts of the day in which the thermostat runs, each with its own rule; outside every
+    # period nothing is queried and the heaters are switched off on every tick. At least one;
+    # periods may abut but not overlap, and a gap between two of them has to last at least
+    # interval_s or not exist at all
+    active_periods:
       # HH:MM, inclusive
-      start:
-      # HH:MM, exclusive; an end before the start crosses midnight
-      end:
-      # IANA name the times are in, e.g. Europe/London
-      time_zone:
+      - start:
+        # HH:MM, exclusive; an end before the start crosses midnight
+        end:
+        # target in °C
+        target_temperature:
+        # whether the heaters are only switched on while a person is present; `false` heats the
+        # room regardless, e.g. before anyone is up
+        require_presence:
     # camera whose person detections decide presence
     camera_ip_address:
     # matches the `location` field of the sensor payload
@@ -42,8 +49,6 @@ thermostats:
     heaters:
       - name:
         ip_address:
-    # target in °C
-    target_temperature:
     # half-width of the band around the target in which the last command is repeated
     deadband:
     # a person detected this many seconds ago still counts as present, at least interval_s and at most 86400 (24 hours)
