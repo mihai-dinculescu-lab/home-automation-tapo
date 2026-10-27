@@ -1,6 +1,6 @@
 use actix::{
-    Actor, ActorContext, ActorFutureExt, AsyncContext, Context, Handler, ResponseActFuture,
-    WrapFuture,
+    Actor, ActorContext, ActorFutureExt, AsyncContext, Context, Handler, Recipient,
+    ResponseActFuture, WrapFuture,
 };
 use actix_web::dev::ServerHandle;
 use tracing::debug;
@@ -8,20 +8,23 @@ use tracing::debug;
 use crate::settings::Api;
 use crate::system::api::web_server::WebServer;
 use crate::system::devices::Devices;
-use crate::system::messages::StopMessage;
+use crate::system::messages::{ProbeMessage, StopMessage};
 
 #[derive(Debug)]
 pub struct ApiActor {
     config_api: Api,
     devices: Devices,
+    /// Probed by the health check.
+    coordinator: Recipient<ProbeMessage>,
     server_handle: Option<ServerHandle>,
 }
 
 impl ApiActor {
-    pub fn new(config_api: Api, devices: Devices) -> Self {
+    pub fn new(config_api: Api, devices: Devices, coordinator: Recipient<ProbeMessage>) -> Self {
         Self {
             config_api,
             devices,
+            coordinator,
             server_handle: None,
         }
     }
@@ -37,11 +40,12 @@ impl Actor for ApiActor {
         let port = self.config_api.port;
 
         let devices = self.devices.clone();
+        let coordinator = self.coordinator.clone();
 
         // Only block the mailbox while the server is being created; it then runs in the
         // background so that StopMessage can still be handled.
         let fut = async move {
-            WebServer::new(&host, port, devices)
+            WebServer::new(&host, port, devices, coordinator)
                 .await
                 .expect("Failed to create the API")
         }

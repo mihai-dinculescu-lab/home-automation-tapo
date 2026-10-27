@@ -17,7 +17,8 @@ use crate::system::api::api_actor::ApiActor;
 use crate::system::device_actor::DeviceActor;
 use crate::system::devices::Devices;
 use crate::system::messages::{
-    DeviceUsageMessage, GetSensorReadingMessage, HealthCheckMessage, SensorReading, StopMessage,
+    DeviceUsageMessage, GetSensorReadingMessage, HealthCheckMessage, ProbeMessage, SensorReading,
+    StopMessage,
 };
 use crate::system::mqtt_actor::MqttActor;
 use crate::system::mqtt_sensors_actor::MqttSensorsActor;
@@ -39,8 +40,9 @@ pub struct CoordinatorActor {
 }
 
 impl CoordinatorActor {
-    #[instrument(name = "CoordinatorActor::new", skip_all)]
-    pub fn new(settings: Settings) -> anyhow::Result<Self> {
+    /// Starts the coordinator and its child actors.
+    #[instrument(name = "CoordinatorActor::spawn", skip_all)]
+    pub fn spawn(settings: Settings) -> anyhow::Result<Addr<Self>> {
         // The actor constructors record their own errors.
         let mqtt_actor =
             MqttActor::new(settings.mqtt.clone()).context("Failed to create the MQTT actor")?;
@@ -51,19 +53,26 @@ impl CoordinatorActor {
 
         let devices = Devices::new(settings.tapo.clone());
 
-        let api_actor = ApiActor::new(settings.api.clone(), devices.clone());
-        let api_actor_addr = api_actor.start();
+        // The API actor probes the coordinator, so it needs the address before the actor exists.
+        Ok(Self::create(move |ctx| {
+            let api_actor = ApiActor::new(
+                settings.api.clone(),
+                devices.clone(),
+                ctx.address().recipient(),
+            );
+            let api_actor_addr = api_actor.start();
 
-        Ok(Self {
-            settings,
-            devices,
-            api_actor_addr,
-            mqtt_actor_addr,
-            mqtt_sensors_actor_addr,
-            device_actors: HashMap::new(),
-            thermostat_actors: HashMap::new(),
-            shutting_down: false,
-        })
+            Self {
+                settings,
+                devices,
+                api_actor_addr,
+                mqtt_actor_addr,
+                mqtt_sensors_actor_addr,
+                device_actors: HashMap::new(),
+                thermostat_actors: HashMap::new(),
+                shutting_down: false,
+            }
+        }))
     }
 
     /// Stops the coordinator and all of its child actors, returning once they have all stopped.
@@ -128,7 +137,11 @@ impl Handler<HealthCheckMessage> for CoordinatorActor {
         // check api
         if !self.api_actor_addr.connected() {
             warn!("API Actor is not connected, restarting...");
-            let api_actor = ApiActor::new(self.settings.api.clone(), self.devices.clone());
+            let api_actor = ApiActor::new(
+                self.settings.api.clone(),
+                self.devices.clone(),
+                ctx.address().recipient(),
+            );
             self.api_actor_addr = api_actor.start();
         }
 
@@ -206,6 +219,14 @@ impl Handler<HealthCheckMessage> for CoordinatorActor {
                 .insert(thermostat.name.clone(), thermostat_actor_addr);
         }
     }
+}
+
+impl Handler<ProbeMessage> for CoordinatorActor {
+    type Result = ();
+
+    /// Answers the API's health check; see `ProbeMessage`. Not traced: the kubelet asks every
+    /// few seconds and the request span already covers the round trip.
+    fn handle(&mut self, _: ProbeMessage, _: &mut Context<Self>) -> Self::Result {}
 }
 
 impl Handler<StopMessage> for CoordinatorActor {

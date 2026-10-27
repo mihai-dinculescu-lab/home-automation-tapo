@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use actix::Actor;
 use tracing::{info, warn};
 
 use home_automation_tapo::settings::Settings;
@@ -25,9 +24,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting home automation tapo system with Actix-RT on Tokio runtime");
 
     // Start coordinator actor
-    let coordinator = CoordinatorActor::new(settings)
-        .expect("Failed to create the CoordinatorActor")
-        .start();
+    let coordinator =
+        CoordinatorActor::spawn(settings).expect("Failed to start the CoordinatorActor");
 
     info!("System started, waiting for shutdown signal...");
 

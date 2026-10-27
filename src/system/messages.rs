@@ -21,6 +21,12 @@ pub struct GetDeviceDataMessage {
 #[rtype(result = "()")]
 pub struct StopMessage;
 
+/// Sent by the API's health check. The reply carries nothing: the round trip itself is the
+/// answer, since it proves that the coordinator is running and draining its mailbox.
+#[derive(Debug, Message)]
+#[rtype(result = "()")]
+pub struct ProbeMessage;
+
 #[derive(Debug, Message)]
 #[rtype(result = "()")]
 pub struct EvaluateMessage {

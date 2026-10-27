@@ -30,11 +30,11 @@ cargo run
 
 The API listens on the `api.host` and `api.port` from `settings.yaml`.
 
-| Method | Path            | JSON body                                                                           | Description                       |
-| ------ | --------------- | ----------------------------------------------------------------------------------- | --------------------------------- |
-| `GET`  | `/health-check` |                                                                                     | Returns `200 OK` if the API is up |
-| `GET`  | `/device`       | `{ "ip_address": "192.168.1.100", "device_type": "plug" }`                          | Returns the `state` of the device |
-| `POST` | `/device`       | `{ "ip_address": "192.168.1.100", "device_type": "plug", "state": { "on": true } }` | Turns the device on or off        |
+| Method | Path            | JSON body                                                                           | Description                                                                       |
+| ------ | --------------- | ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| `GET`  | `/health-check` |                                                                                     | Returns `200 OK` if the coordinator answers within a second, `503` if it does not |
+| `GET`  | `/device`       | `{ "ip_address": "192.168.1.100", "device_type": "plug" }`                          | Returns the `state` of the device                                                 |
+| `POST` | `/device`       | `{ "ip_address": "192.168.1.100", "device_type": "plug", "state": { "on": true } }` | Turns the device on or off                                                        |
 
 Both `/device` endpoints respond with `{ "ip_address": "192.168.1.100", "state": { "on": true } }`. A `POST`
 without `state.on` changes nothing and reports the state the device is in.

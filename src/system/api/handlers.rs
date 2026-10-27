@@ -1,3 +1,7 @@
+use std::error::Error;
+use std::time::Duration;
+
+use actix::Recipient;
 use actix_web::http::StatusCode;
 use actix_web::{HttpResponse, web};
 use futures_util::FutureExt as _;
@@ -6,7 +10,14 @@ use tracing::{instrument, warn};
 
 use crate::system::api::errors::ApiError;
 use crate::system::devices::{DeviceType, Devices, Error as DeviceError};
+use crate::system::messages::ProbeMessage;
 use crate::telemetry::record_error;
+
+/// How long the coordinator gets to answer a probe. The round trip is a message to a handler
+/// that does nothing, so the budget only has to absorb a busy moment on the actors' thread.
+/// The Kubernetes probes allow a little more than this, so that a timeout here is what fails
+/// them rather than the kubelet giving up first.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiStatusResponse {
@@ -48,11 +59,36 @@ pub struct DeviceResponse {
     state: DeviceState,
 }
 
+/// `200 OK` when the coordinator answers a probe in time, `503 Service Unavailable` otherwise.
+///
+/// The web server answers from its own threads, so on its own it would keep reporting a healthy
+/// service after the coordinator has stopped (a closed mailbox) or the thread that every actor
+/// runs on has got stuck (a timeout). The round trip is what lets Kubernetes restart the pod in
+/// either case.
 #[instrument(name = "health_check", skip_all)]
-pub async fn health_check() -> HttpResponse {
-    let body = ApiStatusResponse::new(StatusCode::OK, "OK");
+pub async fn health_check(coordinator: web::Data<Recipient<ProbeMessage>>) -> HttpResponse {
+    // The timeout wraps the whole send rather than using actix's own, which only starts once
+    // the message has been queued: a full mailbox would otherwise hang the probe for good.
+    match tokio::time::timeout(PROBE_TIMEOUT, coordinator.send(ProbeMessage)).await {
+        Ok(Ok(())) => {
+            let body = ApiStatusResponse::new(StatusCode::OK, "OK");
 
-    HttpResponse::Ok().json(body)
+            HttpResponse::Ok().json(body)
+        }
+        Ok(Err(e)) => coordinator_unavailable(&e),
+        Err(e) => coordinator_unavailable(&e),
+    }
+}
+
+fn coordinator_unavailable<E: Error>(e: &E) -> HttpResponse {
+    record_error!(e);
+
+    let body = ApiStatusResponse::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "The coordinator did not answer",
+    );
+
+    HttpResponse::ServiceUnavailable().json(body)
 }
 
 #[instrument(name = "get_device", skip_all, fields(

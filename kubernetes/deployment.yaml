@@ -29,12 +29,17 @@ spec:
             limits:
               cpu: "200m"
               memory: "128Mi"
+          # The health check does a round trip to the coordinator actor, so the probe sees a
+          # coordinator that has stopped or a stuck actor thread, not only a dead web server.
+          # It gives the coordinator a second to answer; the probe allows a little longer so
+          # that it is the round trip that fails, not the kubelet giving up first.
           livenessProbe:
             httpGet:
               path: /health-check
               port: 80
             initialDelaySeconds: 3
             periodSeconds: 5
+            timeoutSeconds: 2
       volumes:
         - name: tapo-config
           secret:
