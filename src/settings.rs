@@ -68,8 +68,8 @@ pub struct Heater {
     pub ip_address: String,
 }
 
-/// The part of the day in which a thermostat runs. Outside it, nothing is queried: the heaters
-/// are switched off once when the period ends and then left alone.
+/// The part of the day in which a thermostat runs. Outside it, nothing is queried and the heaters
+/// are switched off on every tick.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ActivePeriod {
     /// Inclusive, as `HH:MM` in `time_zone`.
@@ -133,7 +133,7 @@ pub struct Thermostat {
     pub heaters: Vec<Heater>,
     /// Target temperature in °C.
     pub target_temperature: f64,
-    /// Half-width of the band around the target in which the heaters are left as they are.
+    /// Half-width of the band around the target in which the last command is repeated.
     pub deadband: f64,
     /// A person detected this many seconds ago still counts as present. At most 24 hours.
     pub presence_window_s: u64,
@@ -141,6 +141,15 @@ pub struct Thermostat {
     pub reading_max_age_s: u64,
     /// How often the thermostat is evaluated.
     pub interval_s: u64,
+}
+
+impl Thermostat {
+    /// Whether the thermostat runs at `now`; without an active period it always does.
+    pub fn is_active(&self, now: DateTime<Utc>) -> bool {
+        self.active_period
+            .as_ref()
+            .is_none_or(|period| period.contains(now))
+    }
 }
 
 #[derive(Debug, Deserialize)]

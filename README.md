@@ -70,11 +70,11 @@ Each enabled entry in `thermostats` is evaluated every `interval_s` seconds. The
 person was detected by the camera in the last `presence_window_s` seconds and the latest sensor reading for
 `sensor_location` is under `target_temperature - deadband`. They are turned **off** when nobody was detected,
 the camera cannot be queried, the reading is missing or older than `reading_max_age_s` seconds, or the
-temperature is above `target_temperature + deadband`. In between, the heaters are left as they are so that
-they do not cycle around the setpoint.
+temperature is above `target_temperature + deadband`. In between, the last command is repeated, so that they do
+not cycle around the setpoint; right after a start there is no last command and they are turned off.
 
-`On` and `Off` are asserted on every tick, so a plug switched by hand is corrected within one interval. On shutdown
-the heaters are switched off, so that a service that does not come back cannot leave them running.
+Every tick commands the heaters, so a plug switched by hand is corrected within one interval. Nothing happens on
+shutdown: the next start asserts the heaters on its first tick.
 
 The readings are not retained, so none is known right after a start and the heaters are turned off until the first
 one arrives. This also covers plugs left on by a run that crashed.
@@ -86,14 +86,54 @@ It also has to be at least `interval_s`, otherwise a person detected between two
 
 `active_period` limits a thermostat to part of the day, from `start` (inclusive) to `end` (exclusive) as `HH:MM`
 in `time_zone` (an IANA name such as `Europe/London`); an `end` before `start` crosses midnight. Outside the period
-nothing is queried: the first tick after the period ends switches the heaters off, the following ticks send no
-command, and only a plug that could not be switched is retried on the next tick. A start outside the period
-switches them off the same way, which covers plugs left on by a run that crashed. Both the period and the rest of
-the day have to last at least `interval_s`, otherwise one of them can pass between two ticks. `active_period` is
+nothing is queried and the heaters are switched off on every tick, which also covers a start outside the period and
+plugs left on by a run that crashed. Both the period and the rest of the day have to last at least `interval_s`,
+otherwise one of them can pass between two ticks. `active_period` is
 optional; without it the thermostat runs around the clock.
 
 `thermostats` is optional; leaving it out or empty disables the thermostat, and a single entry can be switched off
 with `enabled: false`, which leaves its heaters alone.
+
+### Safety properties
+
+The thermostat is held to the guarantees below. Each is a bound that can be checked, not a mechanism. Two are not
+met yet and are marked as such.
+
+1. **A tick every `interval_s`.** The tick loop never waits on the work it starts, and each tick cancels the previous
+   one if it is still running, so a slow camera or plug can neither block the next evaluation nor switch the heaters
+   on older inputs. Every request to a device times out after 10 seconds, so even a tick that has to log in to a
+   slow plug again ends within about a minute.
+2. **A stuck process is replaced within about a minute.** `/health-check` round-trips a probe to the coordinator actor
+   on the thread every actor runs on, so a blocked thread or a stopped coordinator fails the Kubernetes liveness probe,
+   which restarts the pod. A thermostat actor that has died is recreated by the coordinator within 60 seconds.
+3. **The heaters are off within one interval of the active period ending.** Every tick outside the period switches
+   them off, so a plug that could not be switched is tried again on the next one. Both the period and the rest of the
+   day are validated to last at least `interval_s`, so a tick always lands in each.
+4. **Every start asserts Off within seconds, unless fresh inputs say On.** The first tick runs as soon as the actor
+   starts. Outside the period it switches the heaters off; inside it, no reading and no last command are known yet,
+   either of which decides Off. This covers plugs left on by a run that crashed, was killed or was stopped.
+5. **Unknown decides Off.** A camera that cannot be queried, nobody present, a missing reading and a stale reading all
+   switch off. On requires a person present and a fresh reading below the band.
+6. **Exposure is bounded once a trigger disappears.** After a person leaves or a sensor falls silent, the heaters are
+   off within `presence_window_s` or `reading_max_age_s` plus one interval.
+7. **No heater stays on without a fresh On, even with the service gone.** Not met yet. Every safeguard above runs in
+   the service, so a pod that is gone, cut off from the network or unable to reach a plug leaves the plug as it was.
+   The plug's own countdown timer, armed on every On, would close this.
+8. **An undeliverable command or a stopped decision stream raises an alert.** Not met yet. A plug that rejects every
+   command, or a thermostat whose ticks never complete, looks healthy to Kubernetes. Publishing the decisions over MQTT
+   and alerting on switch failures and on gaps between decisions would close this.
+9. **One controller at a time.** The deployment runs a single replica with the `Recreate` strategy, so a deploy
+   stops the old pod before the new one starts and the two never log in to the same plug at once. A local run against
+   the same plugs is the one case this cannot prevent; keep the thermostat `enabled: false` in a local settings file.
+10. **A manual switch is reconciled within one interval.** Every tick commands the heaters: the decision inside the
+    period, Off outside it, and the last command within the deadband. A plug switched by hand is therefore corrected
+    on the next tick wherever the temperature sits.
+11. **Reaching a safe state after a restart depends on nothing outside the LAN.** The settings come from a secret
+    already mounted, and MQTT or the camera being down decides Off. The image is still pulled on every restart, so a
+    registry outage can keep a replacement pod from starting.
+12. **Configuration cannot silently disable safety.** The settings are validated at startup and the service refuses to
+    start on a zero interval, a presence window shorter than the interval, a period or a gap outside it shorter than
+    the interval, a non-finite temperature or deadband, or an enabled thermostat without the sensors.
 
 ## Telemetry
 

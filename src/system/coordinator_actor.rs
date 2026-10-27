@@ -246,19 +246,13 @@ impl Handler<StopMessage> for CoordinatorActor {
         let mqtt_actor_addr = self.mqtt_actor_addr.clone();
         let mqtt_sensors_actor_addr = self.mqtt_sensors_actor_addr.take();
 
-        // The device actors go first: stopping one drops the poll it has in flight, which frees
-        // the plug for the thermostat about to switch it off, and the usage they have already
-        // queued can still be published. The thermostats go next, before the sensors they read
-        // through the coordinator are gone, and together, since each one switches its heaters
-        // off on the way out. The API, MQTT and sensors drains overlap to stay inside the
-        // shutdown timeout.
+        // Nothing has to happen on the way out, so every actor drains at once and the stop takes
+        // as long as the slowest of them: the MQTT publishes in flight or the API's graceful stop.
         Box::pin(
             async move {
-                for device_actor in device_actors {
-                    stop_actor(device_actor).await;
-                }
-                join_all(thermostat_actors.into_iter().map(stop_actor)).await;
                 tokio::join!(
+                    join_all(thermostat_actors.into_iter().map(stop_actor)),
+                    join_all(device_actors.into_iter().map(stop_actor)),
                     stop_actor(api_actor_addr),
                     stop_actor(mqtt_actor_addr),
                     async {

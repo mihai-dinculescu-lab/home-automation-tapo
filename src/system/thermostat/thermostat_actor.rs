@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use actix::{
-    Actor, ActorContext, ActorFutureExt, Addr, AsyncContext, Context, Handler, ResponseActFuture,
-    SpawnHandle, WrapFuture, clock::interval,
+    Actor, ActorContext, ActorFutureExt, Addr, AsyncContext, Context, Handler, SpawnHandle,
+    WrapFuture, clock::interval,
 };
 use chrono::{DateTime, Utc};
 use futures_util::FutureExt as _;
@@ -21,30 +21,19 @@ use crate::{
     telemetry::{consumer_span, producer_span, record_error},
 };
 
-/// Bound on switching the heaters off at a stop. It covers a wait for a slow request already
-/// running on a plug plus the switch itself, and has to leave room inside the actors' shutdown
-/// timeout in `main` for the other actors to drain after the thermostats, the API's graceful
-/// stop among them.
-const STOP_TIMEOUT: Duration = Duration::from_secs(12);
-
 #[derive(Debug)]
 pub struct ThermostatActor {
     coordinator_actor_addr: Addr<CoordinatorActor>,
     devices: Devices,
     config: Thermostat,
-    /// The tick's work in flight, if any: an evaluation, or the switch-off outside the active
-    /// period. The next tick cancels it, so that a slow one can neither hold the thermostat for
-    /// several intervals nor finish after a newer one and switch the heaters on older inputs; a
-    /// stop cancels it, so that it cannot switch the heaters on after they were switched off.
+    /// The tick's work in flight, if any: the evaluation and the switch that follows it. The
+    /// next tick cancels it, so that a slow one can
+    /// neither hold the thermostat for several intervals nor finish after a newer one and switch
+    /// the heaters on older inputs.
     in_flight: Option<SpawnHandle>,
-    /// Set by the stop, so that ticks still queued are ignored while the heaters are switched off.
-    stopping: bool,
-    /// The heaters still to be switched off for the stretch outside the active period, once the
-    /// first tick outside it has tried; `None` before that, at the start and after every tick
-    /// inside the period, so that each heater gets the Off once per period end and once at a
-    /// start outside the period, where a run that crashed may have left it on. A heater that
-    /// could not be switched is kept for the next tick, the ones that were are left alone.
-    pending_off: Option<Vec<Heater>>,
+    /// The command of the last evaluation that completed, which the deadband repeats. `None`
+    /// before the first one, so that a start inside the deadband turns the heaters off.
+    last_command: Option<HeaterCommand>,
 }
 
 impl ThermostatActor {
@@ -61,14 +50,12 @@ impl ThermostatActor {
             devices,
             config,
             in_flight: None,
-            stopping: false,
-            pending_off: None,
+            last_command: None,
         }
     }
 
-    /// Cancels the tick's work in flight, if any. A cancelled evaluation leaves the heaters as
-    /// they are and a cancelled switch-off leaves the unswitched heaters pending, so the caller
-    /// asserts them anew.
+    /// Cancels the tick's work in flight, if any. A cancelled tick leaves the heaters as they
+    /// are, so the caller asserts them anew.
     fn cancel_in_flight(&mut self, ctx: &mut Context<Self>) {
         if let Some(in_flight) = self.in_flight.take() {
             warn!("The previous tick's work is still running, cancelling it");
@@ -93,32 +80,28 @@ impl ThermostatActor {
         );
     }
 
-    /// Records why a tick did nothing, the counterpart of `record_decision` for a skipped tick.
-    fn record_skip(span: &tracing::Span, reason: Reason) {
-        span.record("thermostat.reason", tracing::field::display(reason));
-        debug!("Skipping this tick ({reason})");
-    }
-
-    /// Switches the given heaters off in the current span. Resolves to the heaters that could
-    /// not be switched.
-    fn switch_off(&self, heaters: Vec<Heater>) -> impl Future<Output = Vec<Heater>> + 'static {
-        let devices = self.devices.clone();
-
-        async move { Self::switch_heaters(&devices, heaters, false).await }
-            .instrument(tracing::Span::current())
-    }
-
-    /// One tick: read the inputs, decide, and switch the heaters.
+    /// One tick's inputs and decision. The handler switches the heaters once it has remembered
+    /// the command, so that a tick cancelled mid-switch still leaves the command it decided for
+    /// the deadband to repeat.
     ///
-    /// Camera and plug failures are recorded on the span but do not fail the tick: a camera error
-    /// is a normal `Off` decision and a plug that could not be switched is retried next tick.
+    /// A camera failure is recorded on the span but does not fail the tick: it is a normal `Off`
+    /// decision.
     async fn evaluate(
         coordinator_actor_addr: Addr<CoordinatorActor>,
         devices: Devices,
         config: Thermostat,
-    ) {
+        last_command: Option<HeaterCommand>,
+    ) -> Decision {
         let span = tracing::Span::current();
         let now = Utc::now();
+
+        // Outside the active period nothing is queried and the heaters are switched off.
+        if !config.is_active(now) {
+            let decision = Decision::new(HeaterCommand::Off, Reason::OutsideActivePeriod);
+            Self::record_decision(&span, &config.name, decision);
+
+            return decision;
+        }
 
         // The two inputs are independent, so they are fetched together.
         let (reading, presence) = tokio::join!(
@@ -137,35 +120,22 @@ impl ThermostatActor {
             );
         }
 
-        let decision = decide(now, presence, reading.as_ref(), &config);
+        let decision = decide(now, presence, reading.as_ref(), last_command, &config);
         Self::record_decision(&span, &config.name, decision);
 
-        let on = match decision.command {
-            HeaterCommand::On => true,
-            HeaterCommand::Off => false,
-            HeaterCommand::Keep => return,
-        };
-
-        Self::switch_heaters(&devices, config.heaters, on).await;
+        decision
     }
 
     /// The heaters are independent, so they are switched together: the time taken is that of
-    /// the slowest plug rather than the sum, which matters for the tick deadline and even more
-    /// for the shutdown budget. Returns the heaters that could not be switched.
-    async fn switch_heaters(devices: &Devices, heaters: Vec<Heater>, on: bool) -> Vec<Heater> {
-        let switched = join_all(
+    /// the slowest plug rather than the sum, which matters for the tick deadline. A plug that
+    /// could not be switched is recorded and asserted again next tick.
+    async fn switch_heaters(devices: Devices, heaters: Vec<Heater>, on: bool) {
+        join_all(
             heaters
                 .iter()
-                .map(|heater| Self::switch_heater(devices, heater, on)),
+                .map(|heater| Self::switch_heater(&devices, heater, on)),
         )
         .await;
-
-        heaters
-            .into_iter()
-            .zip(switched)
-            .filter(|(_, switched)| !switched)
-            .map(|(heater, _)| heater)
-            .collect()
     }
 
     async fn query_reading(
@@ -232,7 +202,7 @@ impl ThermostatActor {
         heater.ip_address = %heater.ip_address,
         heater.on = on,
     ))]
-    async fn switch_heater(devices: &Devices, heater: &Heater, on: bool) -> bool {
+    async fn switch_heater(devices: &Devices, heater: &Heater, on: bool) {
         let result = devices
             .run(
                 DeviceType::PlugEnergyMonitoring,
@@ -248,18 +218,12 @@ impl ThermostatActor {
             .await;
 
         match result {
-            Ok(()) => {
-                info!(
-                    "Switched heater '{}' {}",
-                    heater.name,
-                    if on { "on" } else { "off" }
-                );
-                true
-            }
-            Err(e) => {
-                record_error!(&e);
-                false
-            }
+            Ok(()) => info!(
+                "Switched heater '{}' {}",
+                heater.name,
+                if on { "on" } else { "off" }
+            ),
+            Err(e) => record_error!(&e),
         }
     }
 }
@@ -312,35 +276,11 @@ impl Actor for ThermostatActor {
 }
 
 impl Handler<StopMessage> for ThermostatActor {
-    type Result = ResponseActFuture<Self, ()>;
+    type Result = ();
 
-    /// Switches the heaters off before stopping, so that a service that does not come back
-    /// cannot leave them running with nobody checking presence or temperature. A failure or a
-    /// timeout is recorded and otherwise ignored; there is no next tick to retry on.
-    #[instrument(name = "ThermostatActor::Handler<StopMessage>", skip_all, fields(
-        thermostat.name = %self.config.name,
-    ))]
+    /// Stops without touching the heaters: the next start asserts them on its first tick.
     fn handle(&mut self, _: StopMessage, ctx: &mut Context<Self>) -> Self::Result {
-        self.stopping = true;
-
-        // An evaluation still in flight could switch the heaters on after they were switched off.
-        // Unlike at a tick, cutting it short here is expected, so nothing is logged.
-        if let Some(in_flight) = self.in_flight.take() {
-            ctx.cancel_future(in_flight);
-        }
-
-        let switch_off = self.switch_off(self.config.heaters.clone());
-
-        Box::pin(
-            async move {
-                if let Err(e) = tokio::time::timeout(STOP_TIMEOUT, switch_off).await {
-                    record_error!(&e);
-                }
-            }
-            .instrument(tracing::Span::current())
-            .into_actor(self)
-            .map(|_, _, ctx| ctx.stop()),
-        )
+        ctx.stop();
     }
 }
 
@@ -362,58 +302,32 @@ impl Handler<EvaluateMessage> for ThermostatActor {
         );
         let _enter = span.enter();
 
-        if self.stopping {
-            Self::record_skip(&span, Reason::Stopping);
-            return;
-        }
-
-        // Every handled tick asserts the heaters anew, so whatever the previous one left running
-        // is cancelled before it can switch them on older inputs.
+        // Every tick asserts the heaters anew, so whatever the previous one left running is
+        // cancelled before it can switch them on older inputs.
         self.cancel_in_flight(ctx);
 
-        // Outside the active period nothing is queried. Each heater is switched off once, by the
-        // first tick outside it, and then left alone; one that could not be switched is retried
-        // on the next tick, as nobody checks presence or temperature until the period starts.
-        if let Some(period) = &self.config.active_period
-            && !period.contains(Utc::now())
-        {
-            let heaters = self
-                .pending_off
-                .clone()
-                .unwrap_or_else(|| self.config.heaters.clone());
-
-            if heaters.is_empty() {
-                Self::record_skip(&span, Reason::OutsideActivePeriod);
-                return;
-            }
-
-            Self::record_decision(
-                &span,
-                &self.config.name,
-                Decision::new(HeaterCommand::Off, Reason::OutsideActivePeriod),
-            );
-
-            let fut = self
-                .switch_off(heaters)
-                .into_actor(self)
-                .map(|not_switched, act, _| {
-                    act.in_flight = None;
-                    act.pending_off = Some(not_switched);
-                });
-
-            self.in_flight = Some(ctx.spawn(fut));
-            return;
-        }
-
-        self.pending_off = None;
+        let switch_span = span.clone();
 
         let fut = Self::evaluate(
             self.coordinator_actor_addr.clone(),
             self.devices.clone(),
             self.config.clone(),
+            self.last_command,
         )
         .instrument(span.clone())
         .into_actor(self)
+        .then(move |decision, act, _| {
+            // Remembered before the switch, which can be cancelled by the next tick.
+            act.last_command = Some(decision.command);
+
+            Self::switch_heaters(
+                act.devices.clone(),
+                act.config.heaters.clone(),
+                decision.command == HeaterCommand::On,
+            )
+            .instrument(switch_span)
+            .into_actor(act)
+        })
         .map(|_, act, _| act.in_flight = None);
 
         self.in_flight = Some(ctx.spawn(fut));

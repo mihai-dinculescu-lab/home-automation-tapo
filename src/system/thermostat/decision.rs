@@ -16,24 +16,22 @@ pub type Presence = Result<bool, PresenceError>;
 pub enum HeaterCommand {
     On,
     Off,
-    /// Leave the heaters as they are.
-    Keep,
 }
 
-/// Why the heaters were commanded, or why a tick was skipped. The first two are recorded by the
-/// actor rather than by `decide`, so that the span's vocabulary stays in one place.
+/// Why the heaters were commanded. The first one is recorded by the actor rather than by
+/// `decide`, which is only called inside the active period, so that the span's vocabulary stays
+/// in one place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
 pub enum Reason {
     /// The tick fell outside the active period.
     OutsideActivePeriod,
-    /// The thermostat is stopping.
-    Stopping,
     CameraError,
     NobodyPresent,
     NoReading,
     StaleReading,
     AboveTarget,
     BelowTarget,
+    /// The temperature is within the deadband, so the last command is repeated.
     WithinDeadband,
 }
 
@@ -59,13 +57,18 @@ pub fn person_present(detections: &[DetectionResult], window_start: DateTime<Utc
 
 /// Decides what to do with the heaters. The rules are evaluated in order; the first match wins.
 ///
-/// A missing reading turns the heaters off rather than leaving them as they are: the readings
-/// are not retained, so none is known right after a start, and the plugs may have been left on
-/// by a run that crashed.
+/// Every decision is a command, so that each tick asserts the heaters anew and a plug switched
+/// by hand is corrected within one interval. Within the deadband the last command is repeated,
+/// so that the heaters do not cycle around the setpoint; without one, right after a start, they
+/// are turned off.
+///
+/// A missing reading turns the heaters off as well: the readings are not retained, so none is
+/// known right after a start, and the plugs may have been left on by a run that crashed.
 pub fn decide(
     now: DateTime<Utc>,
     presence: Presence,
     reading: Option<&SensorReading>,
+    last_command: Option<HeaterCommand>,
     config: &Thermostat,
 ) -> Decision {
     match presence {
@@ -89,7 +92,10 @@ pub fn decide(
     } else if reading.temperature < config.target_temperature - config.deadband {
         Decision::new(HeaterCommand::On, Reason::BelowTarget)
     } else {
-        Decision::new(HeaterCommand::Keep, Reason::WithinDeadband)
+        Decision::new(
+            last_command.unwrap_or(HeaterCommand::Off),
+            Reason::WithinDeadband,
+        )
     }
 }
 
@@ -144,6 +150,7 @@ mod tests {
             now(),
             Err(PresenceError),
             Some(&reading(20.0, Duration::zero())),
+            None,
             &config(),
         );
 
@@ -159,6 +166,7 @@ mod tests {
             now(),
             Ok(false),
             Some(&reading(20.0, Duration::zero())),
+            None,
             &config(),
         );
 
@@ -170,7 +178,7 @@ mod tests {
 
     #[test]
     fn no_reading_turns_off() {
-        let decision = decide(now(), Ok(true), None, &config());
+        let decision = decide(now(), Ok(true), None, None, &config());
 
         assert_eq!(
             decision,
@@ -184,6 +192,7 @@ mod tests {
             now(),
             Ok(true),
             Some(&reading(20.0, Duration::seconds(901))),
+            None,
             &config(),
         );
 
@@ -199,6 +208,7 @@ mod tests {
             now(),
             Ok(true),
             Some(&reading(20.0, Duration::seconds(900))),
+            None,
             &config(),
         );
 
@@ -214,6 +224,7 @@ mod tests {
             now(),
             Ok(true),
             Some(&reading(22.3, Duration::zero())),
+            Some(HeaterCommand::On),
             &config(),
         );
 
@@ -229,6 +240,7 @@ mod tests {
             now(),
             Ok(true),
             Some(&reading(21.7, Duration::zero())),
+            Some(HeaterCommand::Off),
             &config(),
         );
 
@@ -239,33 +251,54 @@ mod tests {
     }
 
     #[test]
-    fn within_deadband_keeps() {
-        let decision = decide(
-            now(),
-            Ok(true),
-            Some(&reading(22.0, Duration::zero())),
-            &config(),
-        );
-
-        assert_eq!(
-            decision,
-            Decision::new(HeaterCommand::Keep, Reason::WithinDeadband)
-        );
-    }
-
-    #[test]
-    fn deadband_boundaries_keep() {
-        for temperature in [21.75, 22.25] {
+    fn within_deadband_repeats_the_last_command() {
+        for last_command in [HeaterCommand::On, HeaterCommand::Off] {
             let decision = decide(
                 now(),
                 Ok(true),
-                Some(&reading(temperature, Duration::zero())),
+                Some(&reading(22.0, Duration::zero())),
+                Some(last_command),
                 &config(),
             );
 
             assert_eq!(
                 decision,
-                Decision::new(HeaterCommand::Keep, Reason::WithinDeadband),
+                Decision::new(last_command, Reason::WithinDeadband),
+                "last command {last_command}"
+            );
+        }
+    }
+
+    #[test]
+    fn within_deadband_without_a_last_command_turns_off() {
+        let decision = decide(
+            now(),
+            Ok(true),
+            Some(&reading(22.0, Duration::zero())),
+            None,
+            &config(),
+        );
+
+        assert_eq!(
+            decision,
+            Decision::new(HeaterCommand::Off, Reason::WithinDeadband)
+        );
+    }
+
+    #[test]
+    fn deadband_boundaries_repeat_the_last_command() {
+        for temperature in [21.75, 22.25] {
+            let decision = decide(
+                now(),
+                Ok(true),
+                Some(&reading(temperature, Duration::zero())),
+                Some(HeaterCommand::On),
+                &config(),
+            );
+
+            assert_eq!(
+                decision,
+                Decision::new(HeaterCommand::On, Reason::WithinDeadband),
                 "temperature {temperature}"
             );
         }

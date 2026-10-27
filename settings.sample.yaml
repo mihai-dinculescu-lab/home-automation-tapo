@@ -25,9 +25,8 @@ thermostats:
   - name:
     # a disabled thermostat is not started and leaves its heaters alone
     enabled:
-    # optional, the part of the day in which the thermostat runs; outside it, nothing is queried:
-    # the heaters are switched off once when the period ends and then left alone. Leave it out
-    # to run around the clock
+    # optional, the part of the day in which the thermostat runs; outside it, nothing is queried
+    # and the heaters are switched off on every tick. Leave it out to run around the clock
     active_period:
       # HH:MM, inclusive
       start:
@@ -45,7 +44,7 @@ thermostats:
         ip_address:
     # target in °C
     target_temperature:
-    # half-width of the band around the target in which the heaters are left as they are
+    # half-width of the band around the target in which the last command is repeated
     deadband:
     # a person detected this many seconds ago still counts as present, at least interval_s and at most 86400 (24 hours)
     presence_window_s:

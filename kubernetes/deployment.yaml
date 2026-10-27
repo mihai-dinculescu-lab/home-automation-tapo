@@ -4,6 +4,12 @@ metadata:
   name: home-automation-tapo
 spec:
   replicas: 1
+  # A rolling update would run the old pod and the new one together for a few seconds, and a Tapo
+  # plug holds one session, so each pod's login would fail the other's commands. Recreate stops
+  # the old pod before the new one starts; the new pod asserts the heaters on its first tick, so
+  # the gap costs nothing.
+  strategy:
+    type: Recreate
   template:
     metadata:
       name: home-automation-tapo
