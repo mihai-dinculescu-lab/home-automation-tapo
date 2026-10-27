@@ -1,29 +1,28 @@
 use std::time::Duration;
 
 use actix::{
-    Actor, ActorContext, ActorFutureExt, Addr, AsyncContext, Context, Handler, SpawnHandle,
-    WrapFuture, clock::interval,
+    Actor, ActorContext, ActorFutureExt, AsyncContext, Context, Handler, Recipient, SpawnHandle,
+    WrapFuture,
 };
 use chrono::{DateTime, Utc};
 use futures_util::FutureExt as _;
 use futures_util::future::join_all;
-use tracing::{Instrument, debug, info, instrument, warn};
+use tracing::{Instrument, debug, info, info_span, instrument, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::{
     settings::{Heater, Thermostat},
-    system::coordinator_actor::CoordinatorActor,
     system::devices::{DeviceType, Devices},
-    system::messages::{EvaluateMessage, GetSensorReadingMessage, SensorReading, StopMessage},
+    system::messages::{GetSensorReadingMessage, SensorReading, StopMessage},
     system::thermostat::decision::{
         Decision, HeaterCommand, Presence, PresenceError, Reason, decide, person_present,
     },
-    telemetry::{consumer_span, producer_span, record_error},
+    telemetry::record_error,
 };
 
 #[derive(Debug)]
 pub struct ThermostatActor {
-    coordinator_actor_addr: Addr<CoordinatorActor>,
+    reading_recipient: Recipient<GetSensorReadingMessage>,
     devices: Devices,
     config: Thermostat,
     /// The tick's work in flight, if any: the evaluation and the switch that follows it. The
@@ -41,17 +40,58 @@ impl ThermostatActor {
         thermostat.name = %config.name,
     ))]
     pub fn new(
-        coordinator_actor_addr: Addr<CoordinatorActor>,
+        reading_recipient: Recipient<GetSensorReadingMessage>,
         devices: Devices,
         config: Thermostat,
     ) -> Self {
         Self {
-            coordinator_actor_addr,
+            reading_recipient,
             devices,
             config,
             in_flight: None,
             last_command: None,
         }
+    }
+
+    /// Evaluates and switches the heaters, cancelling whatever the previous tick left running.
+    fn tick(&mut self, ctx: &mut Context<Self>) {
+        let span = info_span!(
+            "ThermostatActor::tick",
+            thermostat.name = %self.config.name,
+        );
+        let _enter = span.enter();
+
+        // Every tick asserts the heaters anew, so whatever the previous one left running is
+        // cancelled before it can switch them on older inputs.
+        self.cancel_in_flight(ctx);
+
+        let switch_span = span.clone();
+
+        // Both futures are polled outside the tick's span, and their own spans are only created
+        // on the first poll, so each is instrumented with the tick's span to be traced under it.
+        let fut = Self::evaluate(
+            self.reading_recipient.clone(),
+            self.devices.clone(),
+            self.config.clone(),
+            self.last_command,
+        )
+        .instrument(span.clone())
+        .into_actor(self)
+        .then(move |decision, act, _| {
+            // Remembered before the switch, which can be cancelled by the next tick.
+            act.last_command = Some(decision.command);
+
+            Self::switch_heaters(
+                act.devices.clone(),
+                act.config.heaters.clone(),
+                decision.command == HeaterCommand::On,
+            )
+            .instrument(switch_span)
+            .into_actor(act)
+        })
+        .map(|_, act, _| act.in_flight = None);
+
+        self.in_flight = Some(ctx.spawn(fut));
     }
 
     /// Cancels the tick's work in flight, if any. A cancelled tick leaves the heaters as they
@@ -63,9 +103,9 @@ impl ThermostatActor {
         }
     }
 
-    /// Records a decision on the tick's span and in the log, the one place that names its fields.
-    /// The log line carries the target the tick ran under, so that it shows which period's rule
-    /// decided; there is none outside every period.
+    /// Records a decision on the evaluation's span and in the log, the one place that names its
+    /// fields. The log line carries the target the tick ran under, so that it shows which
+    /// period's rule decided; there is none outside every period.
     fn record_decision(span: &tracing::Span, name: &str, target: Option<f64>, decision: Decision) {
         span.record(
             "thermostat.command",
@@ -84,17 +124,27 @@ impl ThermostatActor {
         );
     }
 
-    /// One tick's inputs and decision. The handler switches the heaters once it has remembered
+    /// One tick's inputs and decision. The tick switches the heaters once it has remembered
     /// the command, so that a tick cancelled mid-switch still leaves the command it decided for
     /// the deadband to repeat.
     ///
     /// Only what the period needs is queried: outside every period nothing is, and inside one
     /// the camera is only consulted when the period requires presence.
     ///
-    /// A camera failure is recorded on the span but does not fail the tick: it is a normal `Off`
-    /// decision.
+    /// A camera failure is recorded on the camera's span but does not fail the tick: it is a
+    /// normal `Off` decision.
+    #[instrument(name = "ThermostatActor::evaluate", skip_all, fields(
+        thermostat.name = %config.name,
+        thermostat.target_temperature = tracing::field::Empty,
+        thermostat.require_presence = tracing::field::Empty,
+        thermostat.person_detected = tracing::field::Empty,
+        thermostat.temperature = tracing::field::Empty,
+        thermostat.reading_age_s = tracing::field::Empty,
+        thermostat.command = tracing::field::Empty,
+        thermostat.reason = tracing::field::Empty,
+    ))]
     async fn evaluate(
-        coordinator_actor_addr: Addr<CoordinatorActor>,
+        reading_recipient: Recipient<GetSensorReadingMessage>,
         devices: Devices,
         config: Thermostat,
         last_command: Option<HeaterCommand>,
@@ -113,16 +163,14 @@ impl ThermostatActor {
         span.record("thermostat.require_presence", period.require_presence);
 
         // The two inputs are independent, so they are fetched together.
-        let (reading, presence) = tokio::join!(
-            Self::query_reading(&coordinator_actor_addr, &config),
-            async {
+        let (reading, presence) =
+            tokio::join!(Self::query_reading(&reading_recipient, &config), async {
                 if period.require_presence {
                     Some(Self::query_presence(&devices, &config, now).await)
                 } else {
                     None
                 }
-            },
-        );
+            });
 
         if let Some(Ok(person_detected)) = presence {
             span.record("thermostat.person_detected", person_detected);
@@ -149,6 +197,9 @@ impl ThermostatActor {
     /// The heaters are independent, so they are switched together: the time taken is that of
     /// the slowest plug rather than the sum, which matters for the tick deadline. A plug that
     /// could not be switched is recorded and asserted again next tick.
+    #[instrument(name = "ThermostatActor::switch_heaters", skip_all, fields(
+        heater.on = on,
+    ))]
     async fn switch_heaters(devices: Devices, heaters: Vec<Heater>, on: bool) {
         join_all(
             heaters
@@ -158,11 +209,14 @@ impl ThermostatActor {
         .await;
     }
 
+    #[instrument(name = "ThermostatActor::query_reading", skip_all, fields(
+        sensor.location = %config.sensor_location,
+    ))]
     async fn query_reading(
-        coordinator_actor_addr: &Addr<CoordinatorActor>,
+        reading_recipient: &Recipient<GetSensorReadingMessage>,
         config: &Thermostat,
     ) -> Option<SensorReading> {
-        let result = coordinator_actor_addr
+        let result = reading_recipient
             .send(GetSensorReadingMessage {
                 span_context: tracing::Span::current().context(),
                 location: config.sensor_location.clone(),
@@ -255,38 +309,19 @@ impl Actor for ThermostatActor {
         thermostat.name = %self.config.name,
     ))]
     fn started(&mut self, ctx: &mut Self::Context) {
-        let addr = ctx.address();
-        let interval_duration = Duration::from_secs(self.config.interval_s);
-        let thermostat_name = self.config.name.clone();
-
         if self.config.heaters.is_empty() {
-            warn!("Thermostat '{thermostat_name}' has no heaters configured");
+            warn!(
+                "Thermostat '{}' has no heaters configured",
+                self.config.name
+            );
         }
 
-        let fut = async move {
-            let mut interval = interval(interval_duration);
-
-            loop {
-                interval.tick().await;
-
-                let span = producer_span!(
-                    name = "ThermostatActor::IntervalTick",
-                    message = EvaluateMessage,
-                    destination = "ThermostatActor",
-                    thermostat.name = %thermostat_name,
-                );
-                let _enter = span.enter();
-
-                if let Err(e) = addr.try_send(EvaluateMessage {
-                    span_context: span.context(),
-                }) {
-                    record_error!(&e);
-                }
-            }
-        }
-        .into_actor(self);
-
-        ctx.spawn(fut);
+        // `run_interval` waits a full interval before its first tick, so the first one is
+        // scheduled at once: a start asserts the heaters straight away. It runs after `started`
+        // returns, so that its trace is its own rather than part of this span.
+        let interval = Duration::from_secs(self.config.interval_s);
+        ctx.run_later(Duration::ZERO, |act, ctx| act.tick(ctx));
+        ctx.run_interval(interval, |act, ctx| act.tick(ctx));
     }
 
     #[instrument(name = "ThermostatActor::stopped", level = "error", skip_all, fields(
@@ -301,57 +336,5 @@ impl Handler<StopMessage> for ThermostatActor {
     /// Stops without touching the heaters: the next start asserts them on its first tick.
     fn handle(&mut self, _: StopMessage, ctx: &mut Context<Self>) -> Self::Result {
         ctx.stop();
-    }
-}
-
-impl Handler<EvaluateMessage> for ThermostatActor {
-    type Result = ();
-
-    fn handle(&mut self, message: EvaluateMessage, ctx: &mut Context<Self>) -> Self::Result {
-        let span = consumer_span!(
-            name = "ThermostatActor::Handler<EvaluateMessage>",
-            message = EvaluateMessage,
-            parent = message.span_context,
-            destination = "ThermostatActor",
-            thermostat.name = %self.config.name,
-            thermostat.target_temperature = tracing::field::Empty,
-            thermostat.require_presence = tracing::field::Empty,
-            thermostat.person_detected = tracing::field::Empty,
-            thermostat.temperature = tracing::field::Empty,
-            thermostat.reading_age_s = tracing::field::Empty,
-            thermostat.command = tracing::field::Empty,
-            thermostat.reason = tracing::field::Empty,
-        );
-        let _enter = span.enter();
-
-        // Every tick asserts the heaters anew, so whatever the previous one left running is
-        // cancelled before it can switch them on older inputs.
-        self.cancel_in_flight(ctx);
-
-        let switch_span = span.clone();
-
-        let fut = Self::evaluate(
-            self.coordinator_actor_addr.clone(),
-            self.devices.clone(),
-            self.config.clone(),
-            self.last_command,
-        )
-        .instrument(span.clone())
-        .into_actor(self)
-        .then(move |decision, act, _| {
-            // Remembered before the switch, which can be cancelled by the next tick.
-            act.last_command = Some(decision.command);
-
-            Self::switch_heaters(
-                act.devices.clone(),
-                act.config.heaters.clone(),
-                decision.command == HeaterCommand::On,
-            )
-            .instrument(switch_span)
-            .into_actor(act)
-        })
-        .map(|_, act, _| act.in_flight = None);
-
-        self.in_flight = Some(ctx.spawn(fut));
     }
 }

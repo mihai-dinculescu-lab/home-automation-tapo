@@ -153,6 +153,7 @@ impl MqttSensorsActor {
     }
 
     /// Disconnects, giving the broker a moment to acknowledge it, then stops.
+    #[instrument(name = "MqttSensorsActor::stop", skip_all)]
     fn stop(&mut self, ctx: &mut Context<Self>) {
         self.stop_requested = true;
 
@@ -171,6 +172,7 @@ impl MqttSensorsActor {
                 warn!(error = %e, "Failed to disconnect from the MQTT broker");
             }
         }
+        .instrument(tracing::Span::current())
         .into_actor(self)
         .map(|_, _, ctx| ctx.stop());
 

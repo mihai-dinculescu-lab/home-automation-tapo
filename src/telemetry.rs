@@ -94,62 +94,11 @@ pub(crate) fn error_stacktrace<E: Error>(e: &E) -> String {
     stacktrace
 }
 
-/// Span for a message exchanged between actors. Internal to the `producer_span!` and
-/// `consumer_span!` helpers.
-///
-/// Any trailing `$fields` are passed through to `info_span!` as extra span fields.
-/// The span name has to be a literal, which is why these helpers are macros.
-#[doc(hidden)]
-macro_rules! message_span {
-    (
-        name = $name:literal,
-        kind = $kind:literal,
-        operation = ($operation_name:literal, $operation_type:literal),
-        message = $message:ident,
-        destination = $destination:literal
-        $(, $($fields:tt)*)?
-    ) => {
-        ::tracing::info_span!(
-            $name,
-            otel.kind = $kind,
-            messaging.system = "actix",
-            actor.message.type = stringify!($message),
-            messaging.operation.name = $operation_name,
-            messaging.operation.type = $operation_type,
-            messaging.destination.name = $destination,
-            $($($fields)*)?
-        )
-    };
-}
-pub(crate) use message_span;
-
-/// Span for sending `message` to the `destination` actor. Enter it, then put its `context()` in
-/// the message so that the receiving handler can parent its span to it.
-///
-/// Any trailing `$fields` are passed through to `info_span!` as extra span fields.
-macro_rules! producer_span {
-    (
-        name = $name:literal,
-        message = $message:ident,
-        destination = $destination:literal
-        $(, $($fields:tt)*)?
-    ) => {
-        $crate::telemetry::message_span!(
-            name = $name,
-            kind = "producer",
-            operation = ("send", "send"),
-            message = $message,
-            destination = $destination
-            $(, $($fields)*)?
-        )
-    };
-}
-pub(crate) use producer_span;
-
 /// Span for handling `message` in the `destination` actor, parented to the context carried by
 /// the message. Must be created before it is entered (see `set_parent_context`).
 ///
 /// Any trailing `$fields` are passed through to `info_span!` as extra span fields.
+/// The span name has to be a literal, which is why this helper is a macro.
 macro_rules! consumer_span {
     (
         name = $name:literal,
@@ -158,13 +107,15 @@ macro_rules! consumer_span {
         destination = $destination:literal
         $(, $($fields:tt)*)?
     ) => {{
-        let span = $crate::telemetry::message_span!(
-            name = $name,
-            kind = "consumer",
-            operation = ("handle", "process"),
-            message = $message,
-            destination = $destination
-            $(, $($fields)*)?
+        let span = ::tracing::info_span!(
+            $name,
+            otel.kind = "consumer",
+            messaging.system = "actix",
+            actor.message.type = stringify!($message),
+            messaging.operation.name = "handle",
+            messaging.operation.type = "process",
+            messaging.destination.name = $destination,
+            $($($fields)*)?
         );
         $crate::telemetry::set_parent_context(&span, $parent);
         span

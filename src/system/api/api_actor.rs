@@ -23,6 +23,7 @@ pub struct ApiActor {
 }
 
 impl ApiActor {
+    #[instrument(name = "ApiActor::new", skip_all)]
     pub fn new(config_api: Api, devices: Devices, coordinator: Recipient<ProbeMessage>) -> Self {
         Self {
             config_api,

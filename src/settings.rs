@@ -229,11 +229,11 @@ impl Settings {
     }
 
     /// Rejects values that deserialize fine but would fail later, where the cause is harder to
-    /// trace back to the settings: a zero interval panics the actor's tick loop, a presence
+    /// trace back to the settings: a zero interval busy-loops its actor's ticks, a presence
     /// window shorter than the interval misses anyone detected early in it and an empty one
-    /// never sees anyone, a presence window over 24 hours is refused by the camera on every
-    /// tick, a zero reading age makes every reading stale and an oversized one overflows the
-    /// age arithmetic, a negative deadband inverts the rules, a non-finite temperature makes
+    /// never sees anyone, a presence window over 24 hours is refused by the camera on
+    /// every tick, a zero reading age makes every reading stale and an oversized one overflows
+    /// the age arithmetic, a negative deadband inverts the rules, a non-finite temperature makes
     /// every comparison false, a duplicate key makes the coordinator skip an entry, a thermostat
     /// without the sensors would never see a reading, one without a period would never heat, an
     /// active period that starts when it ends is either empty or the whole day, which the

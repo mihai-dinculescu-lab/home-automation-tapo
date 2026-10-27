@@ -7,18 +7,6 @@ use crate::settings::Device;
 
 #[derive(Debug, Message)]
 #[rtype(result = "()")]
-pub struct HealthCheckMessage {
-    pub span_context: opentelemetry::Context,
-}
-
-#[derive(Debug, Message)]
-#[rtype(result = "()")]
-pub struct GetDeviceDataMessage {
-    pub span_context: opentelemetry::Context,
-}
-
-#[derive(Debug, Message)]
-#[rtype(result = "()")]
 pub struct StopMessage;
 
 /// Sent by the API's health check. The reply carries nothing: the round trip itself is the
@@ -26,12 +14,6 @@ pub struct StopMessage;
 #[derive(Debug, Message)]
 #[rtype(result = "()")]
 pub struct ProbeMessage;
-
-#[derive(Debug, Message)]
-#[rtype(result = "()")]
-pub struct EvaluateMessage {
-    pub span_context: opentelemetry::Context,
-}
 
 /// The latest reading received from a sensor over MQTT.
 #[derive(Debug, Clone, PartialEq)]

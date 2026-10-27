@@ -97,6 +97,7 @@ impl MqttActor {
     }
 
     /// Disconnects, giving the broker a moment to acknowledge what is in flight, then stops.
+    #[instrument(name = "MqttActor::stop", skip_all)]
     fn stop(&mut self, ctx: &mut Context<Self>) {
         let client = self.client.clone();
 
@@ -113,6 +114,7 @@ impl MqttActor {
                 warn!(error = %e, "Failed to disconnect from the MQTT broker");
             }
         }
+        .instrument(tracing::Span::current())
         .into_actor(self)
         .map(|_, _, ctx| ctx.stop());
 

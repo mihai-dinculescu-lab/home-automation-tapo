@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use actix::clock::{interval, sleep};
+use actix::clock::sleep;
 use actix::dev::ToEnvelope;
 use actix::{
     Actor, ActorContext, ActorFutureExt, Addr, AsyncContext, Context, Handler, ResponseActFuture,
@@ -9,7 +9,7 @@ use actix::{
 };
 use anyhow::Context as _;
 use futures_util::future::join_all;
-use tracing::{Instrument, info, instrument, warn};
+use tracing::{Instrument, info, info_span, instrument, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::settings::{Mqtt, Settings};
@@ -17,13 +17,14 @@ use crate::system::api::api_actor::ApiActor;
 use crate::system::device_actor::DeviceActor;
 use crate::system::devices::Devices;
 use crate::system::messages::{
-    DeviceUsageMessage, GetSensorReadingMessage, HealthCheckMessage, ProbeMessage, SensorReading,
-    StopMessage,
+    DeviceUsageMessage, GetSensorReadingMessage, ProbeMessage, SensorReading, StopMessage,
 };
 use crate::system::mqtt_actor::MqttActor;
 use crate::system::mqtt_sensors_actor::MqttSensorsActor;
 use crate::system::thermostat::thermostat_actor::ThermostatActor;
-use crate::telemetry::{consumer_span, producer_span, record_error};
+use crate::telemetry::{consumer_span, record_error};
+
+const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 pub struct CoordinatorActor {
@@ -79,54 +80,10 @@ impl CoordinatorActor {
     pub async fn stop(addr: Addr<Self>) {
         stop_actor(addr).await;
     }
-}
 
-impl Actor for CoordinatorActor {
-    type Context = Context<Self>;
-
-    #[instrument(name = "CoordinatorActor::started", skip_all)]
-    fn started(&mut self, ctx: &mut Self::Context) {
-        let addr = ctx.address();
-
-        let fut = async move {
-            let mut interval = interval(Duration::from_secs(60));
-
-            loop {
-                interval.tick().await;
-
-                let span = producer_span!(
-                    name = "CoordinatorActor::IntervalTick",
-                    message = HealthCheckMessage,
-                    destination = "CoordinatorActor",
-                );
-                let _enter = span.enter();
-
-                if let Err(e) = addr.try_send(HealthCheckMessage {
-                    span_context: span.context(),
-                }) {
-                    record_error!(&e);
-                }
-            }
-        }
-        .into_actor(self);
-
-        ctx.spawn(fut);
-    }
-
-    #[instrument(name = "CoordinatorActor::stopped", level = "error", skip_all)]
-    fn stopped(&mut self, _: &mut Self::Context) {}
-}
-
-impl Handler<HealthCheckMessage> for CoordinatorActor {
-    type Result = ();
-
-    fn handle(&mut self, message: HealthCheckMessage, ctx: &mut Context<Self>) -> Self::Result {
-        let span = consumer_span!(
-            name = "CoordinatorActor::Handler<HealthCheckMessage>",
-            message = HealthCheckMessage,
-            parent = message.span_context,
-            destination = "CoordinatorActor",
-        );
+    /// The health check: (re)creates every child actor that is missing or has stopped.
+    fn tick(&mut self, ctx: &mut Context<Self>) {
+        let span = info_span!("CoordinatorActor::tick");
         let _enter = span.enter();
 
         // don't restart the actors that are being stopped
@@ -185,7 +142,11 @@ impl Handler<HealthCheckMessage> for CoordinatorActor {
             }
 
             // device actor hasn't been created yet or has died -> (re)create
-            let device_actor = DeviceActor::new(addr.clone(), self.devices.clone(), device.clone());
+            let device_actor = DeviceActor::new(
+                addr.clone().recipient(),
+                self.devices.clone(),
+                device.clone(),
+            );
             let device_actor_addr = device_actor.start();
 
             self.device_actors
@@ -211,14 +172,33 @@ impl Handler<HealthCheckMessage> for CoordinatorActor {
             }
 
             // thermostat actor hasn't been created yet or has died -> (re)create
-            let thermostat_actor =
-                ThermostatActor::new(addr.clone(), self.devices.clone(), thermostat.clone());
+            let thermostat_actor = ThermostatActor::new(
+                addr.clone().recipient(),
+                self.devices.clone(),
+                thermostat.clone(),
+            );
             let thermostat_actor_addr = thermostat_actor.start();
 
             self.thermostat_actors
                 .insert(thermostat.name.clone(), thermostat_actor_addr);
         }
     }
+}
+
+impl Actor for CoordinatorActor {
+    type Context = Context<Self>;
+
+    #[instrument(name = "CoordinatorActor::started", skip_all)]
+    fn started(&mut self, ctx: &mut Self::Context) {
+        // `run_interval` waits a full interval before its first tick, so the first health check,
+        // which creates the device and thermostat actors, is scheduled at once. It runs after
+        // `started` returns, so that its trace is its own rather than part of this span.
+        ctx.run_later(Duration::ZERO, |act, ctx| act.tick(ctx));
+        ctx.run_interval(HEALTH_CHECK_INTERVAL, |act, ctx| act.tick(ctx));
+    }
+
+    #[instrument(name = "CoordinatorActor::stopped", level = "error", skip_all)]
+    fn stopped(&mut self, _: &mut Self::Context) {}
 }
 
 impl Handler<ProbeMessage> for CoordinatorActor {

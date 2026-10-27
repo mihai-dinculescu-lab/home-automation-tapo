@@ -1,25 +1,22 @@
 use std::time::Duration;
 
 use actix::{
-    Actor, ActorContext, ActorFutureExt, Addr, AsyncContext, Context, Handler, WrapFuture,
-    clock::interval,
+    Actor, ActorContext, ActorFutureExt, AsyncContext, Context, Handler, Recipient, WrapFuture,
 };
 use futures_util::FutureExt as _;
-use tracing::{Instrument, instrument, warn};
+use tracing::{Instrument, info_span, instrument, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::{
     settings::Device,
     system::devices::{DeviceType, Devices},
-    system::messages::{DeviceUsageMessage, GetDeviceDataMessage, StopMessage},
-    telemetry::{consumer_span, producer_span, record_error},
+    system::messages::{DeviceUsageMessage, StopMessage},
+    telemetry::record_error,
 };
-
-use super::coordinator_actor::CoordinatorActor;
 
 #[derive(Debug)]
 pub struct DeviceActor {
-    coordinator_actor_addr: Addr<CoordinatorActor>,
+    usage_recipient: Recipient<DeviceUsageMessage>,
     devices: Devices,
     device: Device,
     /// Set while a usage poll is running. A tick that lands meanwhile is skipped rather than
@@ -34,16 +31,44 @@ impl DeviceActor {
         device.ip_address = %device.ip_address,
     ))]
     pub fn new(
-        coordinator_actor_addr: Addr<CoordinatorActor>,
+        usage_recipient: Recipient<DeviceUsageMessage>,
         devices: Devices,
         device: Device,
     ) -> Self {
         Self {
-            coordinator_actor_addr,
+            usage_recipient,
             devices,
             device,
             polling: false,
         }
+    }
+
+    /// Polls the device's usage, unless the previous poll is still running.
+    fn tick(&mut self, ctx: &mut Context<Self>) {
+        let span = info_span!(
+            "DeviceActor::tick",
+            device.name = %self.device.name,
+            device.ip_address = %self.device.ip_address,
+        );
+        let _enter = span.enter();
+
+        if self.polling {
+            warn!("The previous usage poll is still running, skipping this tick");
+            return;
+        }
+
+        self.polling = true;
+
+        let device = self.device.clone();
+        let devices = self.devices.clone();
+        let usage_recipient = self.usage_recipient.clone();
+
+        let fut = Self::query_device_usage(device, devices, usage_recipient)
+            .instrument(span.clone())
+            .into_actor(self)
+            .map(|_, act, _| act.polling = false);
+
+        ctx.spawn(fut);
     }
 
     #[instrument(name = "DeviceActor::query_device_usage", skip_all, fields(
@@ -53,7 +78,7 @@ impl DeviceActor {
     async fn query_device_usage(
         device: Device,
         devices: Devices,
-        coordinator_actor_addr: Addr<CoordinatorActor>,
+        usage_recipient: Recipient<DeviceUsageMessage>,
     ) {
         let span = tracing::Span::current();
 
@@ -67,7 +92,7 @@ impl DeviceActor {
 
         match result {
             Ok(device_usage) => {
-                let result = coordinator_actor_addr.try_send(DeviceUsageMessage {
+                let result = usage_recipient.try_send(DeviceUsageMessage {
                     span_context: span.context(),
                     device,
                     device_usage,
@@ -90,36 +115,13 @@ impl Actor for DeviceActor {
         device.ip_address = %self.device.ip_address,
     ))]
     fn started(&mut self, ctx: &mut Self::Context) {
-        let addr = ctx.address();
         let refresh_rate = Duration::from_secs(self.devices.config().refresh_rate_s);
 
-        let device = self.device.clone();
-
-        let fut = async move {
-            let mut interval = interval(refresh_rate);
-
-            loop {
-                interval.tick().await;
-
-                let span = producer_span!(
-                    name = "DeviceActor::IntervalTick",
-                    message = GetDeviceDataMessage,
-                    destination = "DeviceActor",
-                    device.name = %device.name,
-                    device.ip_address = %device.ip_address,
-                );
-                let _enter = span.enter();
-
-                if let Err(e) = addr.try_send(GetDeviceDataMessage {
-                    span_context: span.context(),
-                }) {
-                    record_error!(&e);
-                }
-            }
-        }
-        .into_actor(self);
-
-        ctx.spawn(fut);
+        // `run_interval` waits a full interval before its first tick, so the first poll is
+        // scheduled at once. It runs after `started` returns, so that its trace is its own rather
+        // than part of this span.
+        ctx.run_later(Duration::ZERO, |act, ctx| act.tick(ctx));
+        ctx.run_interval(refresh_rate, |act, ctx| act.tick(ctx));
     }
     #[instrument(name = "DeviceActor::stopped", level = "error", skip_all, fields(
         device.name = %self.device.name,
@@ -133,39 +135,5 @@ impl Handler<StopMessage> for DeviceActor {
 
     fn handle(&mut self, _: StopMessage, ctx: &mut Context<Self>) -> Self::Result {
         ctx.stop();
-    }
-}
-
-impl Handler<GetDeviceDataMessage> for DeviceActor {
-    type Result = ();
-
-    fn handle(&mut self, message: GetDeviceDataMessage, ctx: &mut Context<Self>) -> Self::Result {
-        let span = consumer_span!(
-            name = "DeviceActor::Handler<GetDeviceDataMessage>",
-            message = GetDeviceDataMessage,
-            parent = message.span_context,
-            destination = "DeviceActor",
-            device.name = %self.device.name,
-            device.ip_address = %self.device.ip_address,
-        );
-        let _enter = span.enter();
-
-        if self.polling {
-            warn!("The previous usage poll is still running, skipping this tick");
-            return;
-        }
-
-        self.polling = true;
-
-        let device = self.device.clone();
-        let devices = self.devices.clone();
-        let coordinator_actor_addr = self.coordinator_actor_addr.clone();
-
-        let fut = Self::query_device_usage(device, devices, coordinator_actor_addr)
-            .instrument(span.clone())
-            .into_actor(self)
-            .map(|_, act, _| act.polling = false);
-
-        ctx.spawn(fut);
     }
 }
