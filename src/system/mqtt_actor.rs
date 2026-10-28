@@ -7,12 +7,14 @@ use paho_mqtt::{
     DisconnectOptionsBuilder, Message, QOS_1,
 };
 use serde_json::json;
-use tapo::responses::DeviceUsageEnergyMonitoringResult;
-use tracing::{Instrument, info, instrument, warn};
+use tracing::{Instrument, instrument, warn};
 
 use crate::{
-    settings::{Device, Mqtt},
-    system::messages::{DeviceUsageMessage, MqttMessagePayload, StopMessage},
+    settings::Mqtt,
+    system::messages::{
+        DeviceUsageMessage, MqttMessagePayload, StopMessage, ThermostatDecisionMessage,
+        ThermostatDecisionPayload,
+    },
     telemetry::{consumer_span, record_error},
 };
 
@@ -32,7 +34,12 @@ const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// How many messages paho queues while the broker is unreachable, oldest dropped first. They are
 /// delivered once the connection is back and lost if the process exits before that.
-const MAX_BUFFERED_MESSAGES: i32 = 100;
+const MAX_BUFFERED_MESSAGES: i32 = 256;
+
+/// The coordinator relays the usage and the decisions with `try_send`, which drops a message when
+/// the mailbox is full. Everything that reaches the coordinator's mailbox can be relayed in a
+/// burst, so this is as large as the coordinator's own.
+const MAILBOX_CAPACITY: usize = 128;
 
 /// Publishes to the broker for every feature; each message names its own topic.
 pub struct MqttActor {
@@ -120,29 +127,68 @@ impl MqttActor {
         ctx.wait(fut);
     }
 
-    #[instrument(name = "MqttActor::send_mqtt_message", skip_all, fields(
+    /// Publishes `payload` under `span`, counting it among the publishes a stop waits for.
+    fn spawn_publish(
+        &mut self,
+        ctx: &mut Context<Self>,
+        span: &tracing::Span,
+        topic_name: String,
+        payload: String,
+        publisher: Publisher,
+    ) {
+        let client = self.client.clone();
+
+        self.publishes_in_flight += 1;
+
+        let fut = Self::publish(client, topic_name, payload, publisher)
+            .instrument(span.clone())
+            .into_actor(self)
+            .map(|_, act, ctx| {
+                act.publishes_in_flight -= 1;
+
+                if act.stop_requested && act.publishes_in_flight == 0 {
+                    act.stop(ctx);
+                }
+            });
+
+        ctx.spawn(fut);
+    }
+
+    #[instrument(name = "MqttActor::publish", skip_all, fields(
         otel.kind = "producer",
         messaging.system = "mqtt",
         messaging.operation.type = "send",
         messaging.destination.name = %topic_name,
-        device.name = %device.name,
-        device.ip_address = %device.ip_address,
+        device.name = tracing::field::Empty,
+        device.ip_address = tracing::field::Empty,
+        thermostat.name = tracing::field::Empty,
     ))]
-    pub async fn send_mqtt_message(
-        device: Device,
-        device_usage: DeviceUsageEnergyMonitoringResult,
+    async fn publish(
         client: AsyncClient,
         topic_name: String,
+        payload: String,
+        publisher: Publisher,
     ) {
-        let payload: MqttMessagePayload = (device, device_usage).into();
-        let payload = json!(payload).to_string();
+        let span = tracing::Span::current();
+        match &publisher {
+            Publisher::Device { name, ip_address } => {
+                span.record("device.name", name.as_str());
+                span.record("device.ip_address", ip_address.as_str());
+            }
+            Publisher::Thermostat { name } => {
+                span.record("thermostat.name", name.as_str());
+            }
+        }
+
+        // The messages are not logged: the usage and the decisions are published every few
+        // minutes, and each decision is logged already when it is made.
         let message = Message::new(topic_name, payload.as_str(), QOS_1);
 
         if !client.is_connected() {
             // Queued by paho (see `MAX_BUFFERED_MESSAGES`); the acknowledgement would only come
             // after a reconnect, so it isn't awaited.
             match client.try_publish(message) {
-                Ok(_) => warn!("MQTT broker disconnected, message buffered: {payload}"),
+                Ok(_) => warn!("MQTT broker disconnected, message buffered"),
                 Err(e) => record_error!(&e),
             }
 
@@ -156,11 +202,17 @@ impl MqttActor {
             .await
             .unwrap_or(Err(paho_mqtt::Error::Timeout));
 
-        match result {
-            Ok(_) => info!("Sent MQTT message: {payload}"),
-            Err(e) => record_error!(&e),
+        if let Err(e) = result {
+            record_error!(&e);
         }
     }
+}
+
+/// What a message is about, recorded on its producer span so that a failed publish, whose error
+/// sits on that span, can be searched for by device or thermostat.
+enum Publisher {
+    Device { name: String, ip_address: String },
+    Thermostat { name: String },
 }
 
 impl Actor for MqttActor {
@@ -168,6 +220,8 @@ impl Actor for MqttActor {
 
     #[instrument(name = "MqttActor::started", skip_all)]
     fn started(&mut self, ctx: &mut Self::Context) {
+        ctx.set_mailbox_capacity(MAILBOX_CAPACITY);
+
         self.connect(ctx);
     }
 
@@ -210,26 +264,51 @@ impl Handler<DeviceUsageMessage> for MqttActor {
             return;
         }
 
-        let client = self.client.clone();
+        let publisher = Publisher::Device {
+            name: message.device.name.clone(),
+            ip_address: message.device.ip_address.clone(),
+        };
+        let payload: MqttMessagePayload = (message.device, message.device_usage).into();
+        let payload = json!(payload).to_string();
 
-        self.publishes_in_flight += 1;
+        self.spawn_publish(ctx, &span, message.topic_name, payload, publisher);
+    }
+}
 
-        let fut = Self::send_mqtt_message(
-            message.device,
-            message.device_usage,
-            client,
-            message.topic_name,
-        )
-        .instrument(span.clone())
-        .into_actor(self)
-        .map(|_, act, ctx| {
-            act.publishes_in_flight -= 1;
+impl Handler<ThermostatDecisionMessage> for MqttActor {
+    type Result = ();
 
-            if act.stop_requested && act.publishes_in_flight == 0 {
-                act.stop(ctx);
-            }
-        });
+    fn handle(
+        &mut self,
+        message: ThermostatDecisionMessage,
+        ctx: &mut Context<Self>,
+    ) -> Self::Result {
+        let span = consumer_span!(
+            name = "MqttActor::Handler<ThermostatDecisionMessage>",
+            message = ThermostatDecisionMessage,
+            parent = message.span_context,
+            destination = "MqttActor",
+            thermostat.name = %message.thermostat_name,
+        );
+        let _enter = span.enter();
 
-        ctx.spawn(fut);
+        // Publishing it would hold up the stop. The coordinator stops the thermostats first, so
+        // none should arrive this late.
+        if self.stop_requested {
+            warn!("Stopping, dropping the thermostat decision");
+            return;
+        }
+
+        let publisher = Publisher::Thermostat {
+            name: message.thermostat_name.clone(),
+        };
+        let payload = ThermostatDecisionPayload::new(
+            message.thermostat_name,
+            message.evaluation,
+            message.heaters,
+        );
+        let payload = json!(payload).to_string();
+
+        self.spawn_publish(ctx, &span, message.topic_name, payload, publisher);
     }
 }

@@ -9,7 +9,7 @@ actix = "0.13"
 actix-rt = "2.15"
 actix-web = { version = "4.18", default-features = false }
 anyhow = "1.0"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 chrono-tz = { version = "0.10", features = ["serde"] }
 config = { version = "0.15", default-features = false, features = ["yaml"] }
 derive_more = { version = "2.1", features = ["display"] }

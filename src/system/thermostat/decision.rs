@@ -1,8 +1,9 @@
 use chrono::{DateTime, Duration, Utc};
 use derive_more::Display;
+use serde::Serialize;
 use tapo::responses::{DetectionResult, RecordingType};
 
-use crate::settings::Thermostat;
+use crate::settings::{ActivePeriod, Thermostat};
 use crate::system::messages::SensorReading;
 
 /// The camera could not be queried, so presence is unknown.
@@ -12,14 +13,17 @@ pub struct PresenceError;
 /// Whether a person is present, or `Err` when the camera could not be queried.
 pub type Presence = Result<bool, PresenceError>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
+/// `Display` names it in the logs and on the spans, `Serialize` in the published decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HeaterCommand {
     On,
     Off,
 }
 
 /// Why the heaters were commanded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Reason {
     /// The tick fell outside every active period.
     OutsideActivePeriod,
@@ -44,6 +48,46 @@ impl Decision {
     pub fn new(command: HeaterCommand, reason: Reason) -> Self {
         Self { command, reason }
     }
+}
+
+/// A tick's decision with the inputs it was made on. Only what the period needed is queried, so
+/// outside every period all of them are `None`.
+#[derive(Debug, Clone)]
+pub struct Evaluation {
+    pub decided_at: DateTime<Utc>,
+    /// The period the tick ran under; `None` outside every period.
+    pub active_period: Option<ActivePeriod>,
+    /// `None` when the camera was not consulted.
+    pub presence: Option<Presence>,
+    pub reading: Option<SensorReading>,
+    pub decision: Decision,
+}
+
+impl Evaluation {
+    /// How old the reading was at `decided_at`, in seconds; `None` without one. The reading is
+    /// fetched after `decided_at` is taken, so one received in between counts as 0 rather than
+    /// a negative age.
+    pub fn reading_age_s(&self) -> Option<i64> {
+        self.reading
+            .as_ref()
+            .map(|reading| reading.age(self.decided_at).num_seconds().max(0))
+    }
+}
+
+/// How switching a heater to the tick's command ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwitchOutcome {
+    Switched,
+    Failed,
+    /// The service was stopping, so the command was not sent.
+    ShuttingDown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HeaterSwitch {
+    pub name: String,
+    pub outcome: SwitchOutcome,
 }
 
 /// A person counts as present when any detection has `Person` among its events and ended at or
@@ -97,7 +141,7 @@ pub fn decide(
         return Decision::new(HeaterCommand::Off, Reason::NoReading);
     };
 
-    if now - reading.received_at > max_age {
+    if reading.age(now) > max_age {
         return Decision::new(HeaterCommand::Off, Reason::StaleReading);
     }
 
@@ -456,5 +500,20 @@ mod tests {
             &[detection(window_start, vec![RecordingType::Person])],
             window_start
         ));
+    }
+
+    #[test]
+    fn reading_age_is_floored_at_zero() {
+        let evaluation = |age: Duration| Evaluation {
+            decided_at: now(),
+            active_period: None,
+            presence: None,
+            reading: Some(reading(21.0, age)),
+            decision: Decision::new(HeaterCommand::Off, Reason::OutsideActivePeriod),
+        };
+
+        assert_eq!(evaluation(Duration::seconds(42)).reading_age_s(), Some(42));
+        // Received while the inputs were fetched, after `decided_at` was taken.
+        assert_eq!(evaluation(Duration::seconds(-1)).reading_age_s(), Some(0));
     }
 }

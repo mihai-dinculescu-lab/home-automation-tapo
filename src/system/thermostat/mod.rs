@@ -1,2 +1,2 @@
-mod decision;
+pub mod decision;
 pub mod thermostat_actor;

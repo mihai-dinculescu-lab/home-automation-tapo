@@ -12,9 +12,9 @@ Actor System consisting of:
 - Coordinator Actor - makes sure that everything is running as expected
 - Device Usage Actor - reads the device usage and sends it to the Coordinator Actor, which forwards it to the MQTT Actor (only when `device_usage` is enabled)
 - Device Session Actor - one per device, runs every request to it on a single session, one at a time
-- MQTT Actor - publishes the data to the MQTT broker (only when `device_usage` or `heating` is enabled)
+- MQTT Actor - publishes the device usage and the thermostat decisions to the MQTT broker (only when `device_usage` or `heating` is enabled)
 - MQTT Sensors Actor - subscribes to the sensor readings on the MQTT broker and keeps the latest one per location (only when `heating` and at least one of its thermostats are enabled)
-- Thermostat Actor - decides whether a room should be heated and switches the heater plugs (only when `heating` and the thermostat are enabled)
+- Thermostat Actor - decides whether a room should be heated, switches the heater plugs and sends the decision to the Coordinator Actor, which forwards it to the MQTT Actor (only when `heating` and the thermostat are enabled)
 - API Actor - REST API for turning devices on/off and getting their status
 
 ## Usage
@@ -68,9 +68,9 @@ by requests with the same `device_type`, so a device that the service also polls
 ## Sensors
 
 While `heating` and at least one of its thermostats are enabled, the service subscribes to the MQTT topic filter
-`heating.sensors_topic_name` (e.g. `sensors/#`) and keeps the latest reading per `location` from JSON payloads with at
-least `{"location": "Living Room", "temperature": 21.4}`. The messages are not retained, so readings are only known
-from the moment the service subscribes.
+`heating.sensors_subscribe_topic` (e.g. `sensors/#`) and keeps the latest reading per `location` from JSON payloads
+with at least `{"location": "Living Room", "temperature": 21.4}`. The messages are not retained, so readings are only
+known from the moment the service subscribes.
 
 ## Thermostat
 
@@ -108,10 +108,44 @@ tick and one inside the repeated hour runs twice; keep the boundaries away from 
 `heating.thermostats` needs at least one entry. `heating.enabled: false` switches every thermostat off, and a single
 entry can be switched off with its own `enabled: false`; either leaves the heaters alone.
 
+### Decisions
+
+Every tick publishes its decision on `heating.decisions_publish_topic` once it has switched the heaters, one message per
+tick for every thermostat, told apart by `thermostat_name`. This is not optional: the stream is what an alert on a
+stopped thermostat or an undeliverable command is built on.
+
+```json
+{
+  "thermostat_name": "Living Room",
+  "decided_at": "2026-10-28T14:00:00.123456789Z",
+  "command": "on",
+  "reason": "below_target",
+  "active_period": { "start": "07:00", "end": "22:00", "target_temperature": 21.0, "require_presence": true },
+  "person_detected": true,
+  "temperature": 20.1,
+  "reading_age_s": 42,
+  "heaters": [{ "name": "Radiator", "outcome": "switched" }]
+}
+```
+
+- `reason` is one of `outside_active_period`, `camera_error`, `nobody_present`, `no_reading`, `stale_reading`,
+  `above_target`, `below_target` and `within_deadband`.
+- `active_period` is the period the tick ran under, with its times in the thermostat's `time_zone`; it is `null`
+  outside every period, and so is every input, since nothing is queried there.
+- `person_detected` is `null` when the period does not require presence or the camera could not be queried.
+- `temperature` and `reading_age_s` are `null` when there is no reading for `sensor_location`.
+- `heaters` lists every heater in the order of the settings with the `outcome` of its switch: `switched`, `failed`, or
+  `shutting_down` when the service was stopping and the command was not sent.
+
+A tick cancelled by the next one publishes nothing, so a gap of more than one `interval_s` between two messages of the
+same thermostat means its ticks are not completing. The messages are not retained, and while the broker is
+unreachable they are buffered together with the device usage, oldest dropped first, so `decided_at` is the time to
+go by rather than the time of arrival.
+
 ### Safety properties
 
 The thermostat is held to the guarantees below. Each is a bound that can be checked, not a mechanism. Two are not
-met yet and are marked as such.
+fully met yet and are marked as such.
 
 1. **A tick every `interval_s`.** The tick loop never waits on the work it starts, and each tick cancels the previous
    one if it is still running, so a slow camera or plug can neither block the next evaluation nor switch the heaters
@@ -138,9 +172,11 @@ met yet and are marked as such.
 7. **No heater stays on without a fresh On, even with the service gone.** Not met yet. Every safeguard above runs in
    the service, so a pod that is gone, cut off from the network or unable to reach a plug leaves the plug as it was.
    The plug's own countdown timer, armed on every On, would close this.
-8. **An undeliverable command or a stopped decision stream raises an alert.** Not met yet. A plug that rejects every
-   command, or a thermostat whose ticks never complete, looks healthy to Kubernetes. Publishing the decisions over MQTT
-   and alerting on switch failures and on gaps between decisions would close this.
+8. **An undeliverable command or a stopped decision stream raises an alert.** Partly met. A plug that rejects every
+   command, or a thermostat whose ticks never complete, looks healthy to Kubernetes, so every completed tick publishes
+   its [decision](#decisions) with the outcome of each switch. The alert itself lives with whatever consumes the
+   topic: on a heater whose `outcome` is `failed`, and on a thermostat with no message for more than about two
+   intervals. `shutting_down` is left out, since a tick that overlaps a deploy reports it.
 9. **One controller at a time.** The deployment runs a single replica with the `Recreate` strategy, so a deploy
    stops the old pod before the new one starts and the two never log in to the same plug at once. A local run against
    the same plugs is the one case this cannot prevent; keep `heating.enabled: false` in a local settings file.
@@ -153,7 +189,8 @@ met yet and are marked as such.
 12. **Configuration cannot silently disable safety.** The settings are validated at startup and the service refuses to
     start on a zero interval, a presence window shorter than the interval, a period or a gap between two of them
     shorter than the interval, overlapping periods, an empty list of periods or thermostats, a key it does not know
-    anywhere in the settings, a non-finite temperature or deadband, or an enabled feature without `mqtt`.
+    anywhere in the settings, a non-finite temperature or deadband, an enabled feature without `mqtt`, or an empty
+    topic.
 
 ## Telemetry
 

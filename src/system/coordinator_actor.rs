@@ -18,7 +18,7 @@ use crate::system::device_usage_actor::DeviceUsageActor;
 use crate::system::devices::{DeviceSessions, device_session_actor::DeviceSessionActor};
 use crate::system::messages::{
     DeviceUsageMessage, GetDeviceSessionMessage, GetSensorReadingMessage, ProbeMessage,
-    SensorReading, StopMessage,
+    SensorReading, StopMessage, ThermostatDecisionMessage,
 };
 use crate::system::mqtt_actor::MqttActor;
 use crate::system::mqtt_sensors_actor::MqttSensorsActor;
@@ -26,6 +26,12 @@ use crate::system::thermostat::thermostat_actor::ThermostatActor;
 use crate::telemetry::{consumer_span, record_error};
 
 const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The usage and the decisions arrive with `try_send`, which drops a message when the mailbox is
+/// full. All the device usage actors poll at the same moment, and a thermostat tick can land on
+/// it, so actix's default of 16 can be exceeded; this leaves room for every sender with a few of
+/// its messages outstanding.
+const MAILBOX_CAPACITY: usize = 128;
 
 #[derive(Debug)]
 pub struct CoordinatorActor {
@@ -153,7 +159,7 @@ impl CoordinatorActor {
                     coordinator_addr.clone().recipient(),
                     DeviceSessions::new(coordinator_addr.clone().recipient()),
                     Duration::from_secs(device_usage.refresh_rate_s),
-                    device_usage.topic_name.clone(),
+                    device_usage.publish_topic.clone(),
                     device.clone(),
                 );
                 let device_usage_actor_addr = device_usage_actor.start();
@@ -181,6 +187,8 @@ impl CoordinatorActor {
                 // thermostat actor hasn't been created yet or has died -> (re)create
                 let thermostat_actor = ThermostatActor::new(
                     coordinator_addr.clone().recipient(),
+                    coordinator_addr.clone().recipient(),
+                    heating.decisions_publish_topic.clone(),
                     DeviceSessions::new(coordinator_addr.clone().recipient()),
                     self.settings.tapo.clone(),
                     thermostat.clone(),
@@ -199,6 +207,8 @@ impl Actor for CoordinatorActor {
 
     #[instrument(name = "CoordinatorActor::started", skip_all)]
     fn started(&mut self, ctx: &mut Self::Context) {
+        ctx.set_mailbox_capacity(MAILBOX_CAPACITY);
+
         // `run_interval` waits a full interval before its first tick, so the first health check,
         // which creates the device and thermostat actors, is scheduled at once. It runs after
         // `started` returns, so that its trace is its own rather than part of this span.
@@ -339,7 +349,10 @@ fn start_mqtt_sensors_actor(settings: &Settings) -> anyhow::Result<Option<Addr<M
     }
 
     let mqtt = settings.mqtt.as_ref().context(MISSING_MQTT)?;
-    let actor = MqttSensorsActor::new(mqtt.address.clone(), heating.sensors_topic_name.clone())?;
+    let actor = MqttSensorsActor::new(
+        mqtt.address.clone(),
+        heating.sensors_subscribe_topic.clone(),
+    )?;
 
     Ok(Some(actor.start()))
 }
@@ -397,9 +410,42 @@ impl Handler<DeviceUsageMessage> for CoordinatorActor {
 
         let result = mqtt_actor_addr.try_send(DeviceUsageMessage {
             span_context: span.context(),
-            topic_name: message.topic_name,
-            device: message.device,
-            device_usage: message.device_usage,
+            ..message
+        });
+
+        if let Err(e) = result {
+            record_error!(&e);
+        }
+    }
+}
+
+impl Handler<ThermostatDecisionMessage> for CoordinatorActor {
+    type Result = ();
+
+    fn handle(
+        &mut self,
+        message: ThermostatDecisionMessage,
+        _: &mut Context<Self>,
+    ) -> Self::Result {
+        let span = consumer_span!(
+            name = "CoordinatorActor::Handler<ThermostatDecisionMessage>",
+            message = ThermostatDecisionMessage,
+            parent = message.span_context,
+            destination = "CoordinatorActor",
+            thermostat.name = %message.thermostat_name,
+        );
+        let _enter = span.enter();
+
+        // Only the thermostats send this, and they run only while `heating` is enabled, which
+        // starts the MQTT actor too.
+        let Some(mqtt_actor_addr) = &self.mqtt_actor_addr else {
+            warn!("The MQTT actor is not running, dropping the thermostat decision");
+            return;
+        };
+
+        let result = mqtt_actor_addr.try_send(ThermostatDecisionMessage {
+            span_context: span.context(),
+            ..message
         });
 
         if let Err(e) = result {

@@ -16,7 +16,7 @@ device_usage:
   # how often to fetch the device usage of devices
   refresh_rate_s:
   # topic the usage is published on
-  topic_name:
+  publish_topic:
   # at least one; set `enabled` to `false` to switch the polling off
   devices:
     - name:
@@ -29,7 +29,9 @@ heating:
   # kept as written
   enabled:
   # topic filter the sensor readings the thermostats use are received on, e.g. `sensors/#`
-  sensors_topic_name:
+  sensors_subscribe_topic:
+  # topic every thermostat's decisions are published on, one message per tick
+  decisions_publish_topic:
   # at least one; set `enabled` to `false` to switch the heating off
   thermostats:
     - name:

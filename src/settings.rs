@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::ensure;
 use chrono::{DateTime, NaiveTime, Utc};
 use chrono_tz::Tz;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tapo::ApiClient;
 
 /// The longest window the camera's detection search accepts.
@@ -62,7 +62,7 @@ pub struct DeviceUsage {
     /// How often the usage of each device is fetched.
     pub refresh_rate_s: u64,
     /// Topic the usage is published on.
-    pub topic_name: String,
+    pub publish_topic: String,
     /// At least one.
     pub devices: Vec<Device>,
 }
@@ -92,15 +92,23 @@ pub struct Heater {
 ///
 /// Unknown keys are rejected, as on `Thermostat`: a per-period `deadband` or a `time_zone` left
 /// over from the single-period shape would otherwise be read and silently dropped.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// It is serialized as written, into the published decisions.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActivePeriod {
     /// Inclusive, as `HH:MM` in the thermostat's `time_zone`.
-    #[serde(deserialize_with = "deserialize_time")]
+    #[serde(
+        deserialize_with = "deserialize_time",
+        serialize_with = "serialize_time"
+    )]
     pub start: NaiveTime,
     /// Exclusive, as `HH:MM` in the thermostat's `time_zone`. An end before the start crosses
     /// midnight.
-    #[serde(deserialize_with = "deserialize_time")]
+    #[serde(
+        deserialize_with = "deserialize_time",
+        serialize_with = "serialize_time"
+    )]
     pub end: NaiveTime,
     /// Target temperature in °C.
     pub target_temperature: f64,
@@ -168,6 +176,11 @@ fn deserialize_time<'de, D: Deserializer<'de>>(deserializer: D) -> Result<NaiveT
     })
 }
 
+/// `HH:MM`, as `deserialize_time` reads it.
+fn serialize_time<S: Serializer>(time: &NaiveTime, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.collect_str(&time.format("%H:%M"))
+}
+
 /// Unknown keys are rejected so that a settings file in the shape of an earlier release, which
 /// kept `active_period` and `target_temperature` here, fails at startup instead of being read
 /// with those silently ignored.
@@ -187,7 +200,7 @@ pub struct Thermostat {
     pub camera_ip_address: String,
     /// Matches the `location` field of the sensor payload.
     pub sensor_location: String,
-    /// Plugs switched together. Optional; without any, the decision is only logged.
+    /// Plugs switched together. Optional; without any, the decision is only logged and published.
     #[serde(default)]
     pub heaters: Vec<Heater>,
     /// Half-width of the band around the target in which the last command is repeated.
@@ -220,7 +233,10 @@ pub struct Heating {
     /// is kept as written.
     pub enabled: bool,
     /// Topic filter the sensor readings are received on, e.g. `sensors/#`.
-    pub sensors_topic_name: String,
+    pub sensors_subscribe_topic: String,
+    /// Topic every thermostat's decisions are published on. Not optional: the decision stream is
+    /// what an alert on a stopped thermostat or an undeliverable command is built on.
+    pub decisions_publish_topic: String,
     /// At least one; a single thermostat is switched off with its own `enabled`.
     pub thermostats: Vec<Thermostat>,
 }
@@ -292,8 +308,9 @@ impl Settings {
     /// would never heat, an active period that starts when it ends is either empty or the whole
     /// day, which the thermostat cannot tell apart, one shorter than the interval can pass
     /// between two ticks without either landing in it, two that overlap leave the rule for the
-    /// overlap to the order of the list, and a gap between two periods shorter than the interval
-    /// can pass between two ticks without the `Off` handover ever happening.
+    /// overlap to the order of the list, a gap between two periods shorter than the interval
+    /// can pass between two ticks without the `Off` handover ever happening, and an empty topic
+    /// leaves its feature with nothing to publish on or subscribe to.
     fn validate(&self) -> Result<(), anyhow::Error> {
         ensure!(
             self.mqtt.is_some()
@@ -313,12 +330,21 @@ impl Settings {
     }
 }
 
+/// A topic has to be given. Whether it is a valid one is left to paho, which refuses it on the
+/// publish or the subscription.
+fn validate_topic(key: &str, topic: &str) -> Result<(), anyhow::Error> {
+    ensure!(!topic.is_empty(), "{key} must not be empty");
+
+    Ok(())
+}
+
 impl DeviceUsage {
     fn validate(&self) -> Result<(), anyhow::Error> {
         ensure!(
             self.refresh_rate_s > 0,
             "device_usage.refresh_rate_s must be greater than 0"
         );
+        validate_topic("device_usage.publish_topic", &self.publish_topic)?;
         ensure!(
             !self.devices.is_empty(),
             "device_usage.devices must have at least one entry; set device_usage.enabled to \
@@ -345,6 +371,15 @@ impl Heating {
             "heating.thermostats must have at least one entry; set heating.enabled to false to \
              switch the heating off"
         );
+
+        validate_topic(
+            "heating.sensors_subscribe_topic",
+            &self.sensors_subscribe_topic,
+        )?;
+        validate_topic(
+            "heating.decisions_publish_topic",
+            &self.decisions_publish_topic,
+        )?;
 
         let mut names = HashSet::new();
         for thermostat in &self.thermostats {
@@ -511,12 +546,13 @@ mod tests {
             device_usage: Some(DeviceUsage {
                 enabled: true,
                 refresh_rate_s: 600,
-                topic_name: "devices/tapo".to_string(),
+                publish_topic: "devices/tapo".to_string(),
                 devices: vec![device("192.168.1.100")],
             }),
             heating: Some(Heating {
                 enabled: true,
-                sensors_topic_name: "sensors/#".to_string(),
+                sensors_subscribe_topic: "sensors/#".to_string(),
+                decisions_publish_topic: "thermostats/decisions".to_string(),
                 thermostats: vec![thermostat("Living Room")],
             }),
         }
@@ -556,6 +592,40 @@ mod tests {
         device_usage(&mut settings).refresh_rate_s = 0;
 
         assert!(error(&settings).contains("refresh_rate_s"));
+    }
+
+    #[test]
+    fn empty_topic_is_rejected_even_when_disabled() {
+        for enabled in [true, false] {
+            // The error of the settings with one topic emptied by `clear`.
+            let error_with = |clear: fn(&mut Settings)| {
+                let mut settings = settings();
+                device_usage(&mut settings).enabled = enabled;
+                heating(&mut settings).enabled = enabled;
+                clear(&mut settings);
+                error(&settings)
+            };
+
+            for (key, error) in [
+                (
+                    "device_usage.publish_topic",
+                    error_with(|settings| device_usage(settings).publish_topic.clear()),
+                ),
+                (
+                    "heating.sensors_subscribe_topic",
+                    error_with(|settings| heating(settings).sensors_subscribe_topic.clear()),
+                ),
+                (
+                    "heating.decisions_publish_topic",
+                    error_with(|settings| heating(settings).decisions_publish_topic.clear()),
+                ),
+            ] {
+                assert!(
+                    error.contains(&format!("{key} must not be empty")),
+                    "{key}, enabled {enabled}: {error}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -933,7 +1003,8 @@ tapo: { username: "", password: "" }
 mqtt: { address: tcp://localhost:1883 }
 heating:
   enabled: true
-  sensors_topic_name: "sensors/#"
+  sensors_subscribe_topic: "sensors/#"
+  decisions_publish_topic: thermostats/decisions
 "#;
 
     fn parse(yaml: &str) -> Result<Settings, config::ConfigError> {
@@ -1102,8 +1173,9 @@ tapo: { username: "", password: "" }
     #[test]
     fn section_without_enabled_is_rejected() {
         for section in [
-            "device_usage: { refresh_rate_s: 600, topic_name: devices/tapo, devices: [] }",
-            "heating: { sensors_topic_name: \"sensors/#\", thermostats: [] }",
+            "device_usage: { refresh_rate_s: 600, publish_topic: devices/tapo, devices: [] }",
+            "heating: { sensors_subscribe_topic: \"sensors/#\", decisions_publish_topic: \
+             thermostats/decisions, thermostats: [] }",
         ] {
             let error = parse(&format!("{YAML_BASE}{section}\n"))
                 .expect_err("enabled is required")
@@ -1114,9 +1186,26 @@ tapo: { username: "", password: "" }
     }
 
     #[test]
+    fn heating_without_decisions_publish_topic_is_rejected() {
+        let yaml = format!(
+            "{YAML_BASE}heating: {{ enabled: false, sensors_subscribe_topic: \"sensors/#\", \
+             thermostats: [] }}\n"
+        );
+
+        let error = parse(&yaml)
+            .expect_err("decisions_publish_topic is required")
+            .to_string();
+        assert!(
+            error.contains("decisions_publish_topic"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn heating_without_thermostats_is_rejected() {
         let yaml = format!(
-            "{YAML_BASE}heating: {{ enabled: false, sensors_topic_name: \"sensors/#\" }}\n"
+            "{YAML_BASE}heating: {{ enabled: false, sensors_subscribe_topic: \"sensors/#\", \
+             decisions_publish_topic: thermostats/decisions }}\n"
         );
 
         let error = parse(&yaml)
@@ -1154,6 +1243,28 @@ tapo: { username: "", password: "" }
             assert!(
                 error.contains("unknown field"),
                 "unexpected error: {error}\n{yaml}"
+            );
+        }
+    }
+
+    #[test]
+    fn topic_keys_without_their_direction_are_rejected() {
+        // The topic keys of the release before they were named for whether they are published
+        // on or subscribed to. Each has to fail rather than be ignored.
+        for section in [
+            "device_usage: { enabled: false, refresh_rate_s: 600, publish_topic: devices/tapo, \
+             topic_name: devices/tapo, devices: [] }",
+            "heating: { enabled: false, sensors_subscribe_topic: \"sensors/#\", \
+             decisions_publish_topic: thermostats/decisions, sensors_topic_name: \"sensors/#\", \
+             thermostats: [] }",
+        ] {
+            let error = parse(&format!("{YAML_BASE}{section}\n"))
+                .expect_err("unknown keys are rejected")
+                .to_string();
+
+            assert!(
+                error.contains("unknown field"),
+                "unexpected error: {error}\n{section}"
             );
         }
     }
