@@ -76,6 +76,8 @@ pub struct GetDeviceUsageMessage {
 #[rtype(result = "()")]
 pub struct DeviceUsageMessage {
     pub span_context: opentelemetry::Context,
+    /// The topic the usage is published on.
+    pub topic_name: String,
     pub device: Device,
     pub device_usage: DeviceUsageEnergyMonitoringResult,
 }

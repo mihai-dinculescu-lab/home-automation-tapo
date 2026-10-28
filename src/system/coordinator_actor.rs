@@ -12,7 +12,7 @@ use futures_util::future::join_all;
 use tracing::{Instrument, info, info_span, instrument, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-use crate::settings::{Mqtt, Settings};
+use crate::settings::Settings;
 use crate::system::api::api_actor::ApiActor;
 use crate::system::device_usage_actor::DeviceUsageActor;
 use crate::system::devices::{DeviceSessions, device_session_actor::DeviceSessionActor};
@@ -34,8 +34,9 @@ pub struct CoordinatorActor {
     /// single session, so every request to it goes through this one actor.
     device_session_actor_addrs: HashMap<String, Addr<DeviceSessionActor>>,
     api_actor_addr: Addr<ApiActor>,
-    mqtt_actor_addr: Addr<MqttActor>,
-    /// `None` when `mqtt.sensors` is missing or disabled.
+    /// `None` when neither `device_usage` nor `heating` is enabled.
+    mqtt_actor_addr: Option<Addr<MqttActor>>,
+    /// `None` when `heating` is disabled or none of its thermostats is enabled.
     mqtt_sensors_actor_addr: Option<Addr<MqttSensorsActor>>,
     device_usage_actor_addrs: HashMap<String, Addr<DeviceUsageActor>>,
     thermostat_actor_addrs: HashMap<String, Addr<ThermostatActor>>,
@@ -46,12 +47,12 @@ impl CoordinatorActor {
     /// Starts the coordinator and its child actors.
     #[instrument(name = "CoordinatorActor::spawn", skip_all)]
     pub fn spawn(settings: Settings) -> anyhow::Result<Addr<Self>> {
-        // The actor constructors record their own errors.
-        let mqtt_actor =
-            MqttActor::new(settings.mqtt.clone()).context("Failed to create the MQTT actor")?;
-        let mqtt_actor_addr = mqtt_actor.start();
+        // The actor constructors record their own errors. A missing `mqtt` fails here, like an
+        // invalid settings file, so the health check never meets it.
+        let mqtt_actor_addr =
+            start_mqtt_actor(&settings).context("Failed to create the MQTT actor")?;
 
-        let mqtt_sensors_actor_addr = start_mqtt_sensors_actor(&settings.mqtt)
+        let mqtt_sensors_actor_addr = start_mqtt_sensors_actor(&settings)
             .context("Failed to create the MQTT sensors actor")?;
 
         // The API actor probes the coordinator, and every actor that talks to a device asks it
@@ -106,11 +107,13 @@ impl CoordinatorActor {
         }
 
         // check mqtt
-        if !self.mqtt_actor_addr.connected() {
+        if let Some(mqtt_actor_addr) = &self.mqtt_actor_addr
+            && !mqtt_actor_addr.connected()
+        {
             warn!("MQTT Actor is not connected, restarting...");
             // A failure is recorded by `MqttActor::new` and retried on the next tick.
-            if let Ok(mqtt_actor) = MqttActor::new(self.settings.mqtt.clone()) {
-                self.mqtt_actor_addr = mqtt_actor.start();
+            if let Ok(mqtt_actor_addr) = start_mqtt_actor(&self.settings) {
+                self.mqtt_actor_addr = mqtt_actor_addr;
             }
         }
 
@@ -120,70 +123,73 @@ impl CoordinatorActor {
         {
             warn!("MQTT Sensors Actor is not connected, restarting...");
             // A failure is recorded by `MqttSensorsActor::new` and retried on the next tick.
-            if let Ok(mqtt_sensors_actor_addr) = start_mqtt_sensors_actor(&self.settings.mqtt) {
+            if let Ok(mqtt_sensors_actor_addr) = start_mqtt_sensors_actor(&self.settings) {
                 self.mqtt_sensors_actor_addr = mqtt_sensors_actor_addr;
             }
         }
 
         // check devices
-        for device in &self.settings.devices {
-            match self.device_usage_actor_addrs.get(&device.ip_address) {
-                // device usage actor is alive and well, nothing to do here
-                Some(device_usage_actor_addr) if device_usage_actor_addr.connected() => continue,
-                Some(_) => warn!(
-                    device.name = device.name,
-                    device.ip_address = device.ip_address,
-                    "Device usage actor is not connected, restarting...",
-                ),
-                None => info!(
-                    device.name = device.name,
-                    device.ip_address = device.ip_address,
-                    "Device usage actor not found, creating a new one...",
-                ),
+        if let Some(device_usage) = self.settings.enabled_device_usage() {
+            for device in &device_usage.devices {
+                match self.device_usage_actor_addrs.get(&device.ip_address) {
+                    // device usage actor is alive and well, nothing to do here
+                    Some(device_usage_actor_addr) if device_usage_actor_addr.connected() => {
+                        continue;
+                    }
+                    Some(_) => warn!(
+                        device.name = device.name,
+                        device.ip_address = device.ip_address,
+                        "Device usage actor is not connected, restarting...",
+                    ),
+                    None => info!(
+                        device.name = device.name,
+                        device.ip_address = device.ip_address,
+                        "Device usage actor not found, creating a new one...",
+                    ),
+                }
+
+                // device usage actor hasn't been created yet or has died -> (re)create
+                let device_usage_actor = DeviceUsageActor::new(
+                    coordinator_addr.clone().recipient(),
+                    DeviceSessions::new(coordinator_addr.clone().recipient()),
+                    Duration::from_secs(device_usage.refresh_rate_s),
+                    device_usage.topic_name.clone(),
+                    device.clone(),
+                );
+                let device_usage_actor_addr = device_usage_actor.start();
+
+                self.device_usage_actor_addrs
+                    .insert(device.ip_address.clone(), device_usage_actor_addr);
             }
-
-            // device usage actor hasn't been created yet or has died -> (re)create
-            let device_usage_actor = DeviceUsageActor::new(
-                coordinator_addr.clone().recipient(),
-                DeviceSessions::new(coordinator_addr.clone().recipient()),
-                Duration::from_secs(self.settings.tapo.refresh_rate_s),
-                device.clone(),
-            );
-            let device_usage_actor_addr = device_usage_actor.start();
-
-            self.device_usage_actor_addrs
-                .insert(device.ip_address.clone(), device_usage_actor_addr);
         }
 
         // check thermostats
-        for thermostat in &self.settings.thermostats {
-            if !thermostat.enabled {
-                continue;
+        if let Some(heating) = self.settings.enabled_heating() {
+            for thermostat in heating.enabled_thermostats() {
+                match self.thermostat_actor_addrs.get(&thermostat.name) {
+                    Some(thermostat_actor_addr) if thermostat_actor_addr.connected() => continue,
+                    Some(_) => warn!(
+                        thermostat.name = thermostat.name,
+                        "Thermostat actor is not connected, restarting...",
+                    ),
+                    None => info!(
+                        thermostat.name = thermostat.name,
+                        "Thermostat actor not found, creating a new one...",
+                    ),
+                }
+
+                // thermostat actor hasn't been created yet or has died -> (re)create
+                let thermostat_actor = ThermostatActor::new(
+                    coordinator_addr.clone().recipient(),
+                    DeviceSessions::new(coordinator_addr.clone().recipient()),
+                    self.settings.tapo.clone(),
+                    thermostat.clone(),
+                );
+                let thermostat_actor_addr = thermostat_actor.start();
+
+                self.thermostat_actor_addrs
+                    .insert(thermostat.name.clone(), thermostat_actor_addr);
             }
-
-            match self.thermostat_actor_addrs.get(&thermostat.name) {
-                Some(thermostat_actor_addr) if thermostat_actor_addr.connected() => continue,
-                Some(_) => warn!(
-                    thermostat.name = thermostat.name,
-                    "Thermostat actor is not connected, restarting...",
-                ),
-                None => info!(
-                    thermostat.name = thermostat.name,
-                    "Thermostat actor not found, creating a new one...",
-                ),
-            }
-
-            // thermostat actor hasn't been created yet or has died -> (re)create
-            let thermostat_actor = ThermostatActor::new(
-                coordinator_addr.clone().recipient(),
-                DeviceSessions::new(coordinator_addr.clone().recipient()),
-                self.settings.tapo.clone(),
-                thermostat.clone(),
-            );
-            let thermostat_actor_addr = thermostat_actor.start();
-
-            self.thermostat_actor_addrs
-                .insert(thermostat.name.clone(), thermostat_actor_addr);
         }
     }
 }
@@ -250,12 +256,8 @@ impl Handler<StopMessage> for CoordinatorActor {
 
                 tokio::join!(
                     stop_actor(api_actor_addr),
-                    stop_actor(mqtt_actor_addr),
-                    async {
-                        if let Some(mqtt_sensors_actor_addr) = mqtt_sensors_actor_addr {
-                            stop_actor(mqtt_sensors_actor_addr).await;
-                        }
-                    }
+                    stop_optional_actor(mqtt_actor_addr),
+                    stop_optional_actor(mqtt_sensors_actor_addr),
                 );
             }
             .into_actor(self)
@@ -309,15 +311,35 @@ impl Handler<GetDeviceSessionMessage> for CoordinatorActor {
     }
 }
 
-/// Starts a `MqttSensorsActor` when `mqtt.sensors` is present and enabled.
-fn start_mqtt_sensors_actor(
-    mqtt: &Mqtt,
-) -> Result<Option<Addr<MqttSensorsActor>>, paho_mqtt::Error> {
-    let Some(sensors) = mqtt.sensors.clone().filter(|sensors| sensors.enabled) else {
+/// The message of a feature enabled without `mqtt`, which `Settings::validate` rejects too.
+const MISSING_MQTT: &str = "mqtt is not set, but a feature that uses it is enabled";
+
+/// Starts a `MqttActor` when `device_usage` or `heating` is enabled; the latter is for the
+/// thermostats' decisions, so it holds even when none of them is enabled.
+fn start_mqtt_actor(settings: &Settings) -> anyhow::Result<Option<Addr<MqttActor>>> {
+    if settings.enabled_device_usage().is_none() && settings.enabled_heating().is_none() {
+        return Ok(None);
+    }
+
+    let mqtt = settings.mqtt.as_ref().context(MISSING_MQTT)?;
+    let actor = MqttActor::new(mqtt.clone())?;
+
+    Ok(Some(actor.start()))
+}
+
+/// Starts a `MqttSensorsActor` when `heating` is enabled and so is at least one of its
+/// thermostats, the only readers of the sensors.
+fn start_mqtt_sensors_actor(settings: &Settings) -> anyhow::Result<Option<Addr<MqttSensorsActor>>> {
+    let Some(heating) = settings.enabled_heating() else {
         return Ok(None);
     };
 
-    let actor = MqttSensorsActor::new(mqtt.address.clone(), sensors)?;
+    if heating.enabled_thermostats().next().is_none() {
+        return Ok(None);
+    }
+
+    let mqtt = settings.mqtt.as_ref().context(MISSING_MQTT)?;
+    let actor = MqttSensorsActor::new(mqtt.address.clone(), heating.sensors_topic_name.clone())?;
 
     Ok(Some(actor.start()))
 }
@@ -332,6 +354,17 @@ where
     let _ = addr.send(StopMessage).await;
 
     wait_until_stopped(&addr).await;
+}
+
+/// `stop_actor` for an actor that only runs when its feature is enabled.
+async fn stop_optional_actor<A>(addr: Option<Addr<A>>)
+where
+    A: Actor + Handler<StopMessage>,
+    A::Context: ToEnvelope<A, StopMessage>,
+{
+    if let Some(addr) = addr {
+        stop_actor(addr).await;
+    }
 }
 
 /// Waits until the actor's mailbox is gone, i.e. `stopped()` has run.
@@ -355,12 +388,18 @@ impl Handler<DeviceUsageMessage> for CoordinatorActor {
         );
         let _enter = span.enter();
 
-        let result = self.mqtt_actor_addr.try_send({
-            DeviceUsageMessage {
-                span_context: span.context(),
-                device: message.device,
-                device_usage: message.device_usage,
-            }
+        // Only the device usage actors send this, and they run only while `device_usage` is
+        // enabled, which starts the MQTT actor too.
+        let Some(mqtt_actor_addr) = &self.mqtt_actor_addr else {
+            warn!("The MQTT actor is not running, dropping the device usage");
+            return;
+        };
+
+        let result = mqtt_actor_addr.try_send(DeviceUsageMessage {
+            span_context: span.context(),
+            topic_name: message.topic_name,
+            device: message.device,
+            device_usage: message.device_usage,
         });
 
         if let Err(e) = result {

@@ -19,6 +19,8 @@ pub struct DeviceUsageActor {
     device_sessions: DeviceSessions,
     /// How often the device's usage is polled.
     refresh_rate: Duration,
+    /// The topic the usage is published on.
+    topic_name: String,
     device: Device,
     /// Set while a usage poll is running. A tick that lands meanwhile is skipped rather than
     /// queued behind it, so that a plug that answers slowly gets one poll at a time instead of
@@ -35,12 +37,14 @@ impl DeviceUsageActor {
         usage_recipient: Recipient<DeviceUsageMessage>,
         device_sessions: DeviceSessions,
         refresh_rate: Duration,
+        topic_name: String,
         device: Device,
     ) -> Self {
         Self {
             usage_recipient,
             device_sessions,
             refresh_rate,
+            topic_name,
             device,
             polling: false,
         }
@@ -63,10 +67,11 @@ impl DeviceUsageActor {
         self.polling = true;
 
         let device = self.device.clone();
+        let topic_name = self.topic_name.clone();
         let device_sessions = self.device_sessions.clone();
         let usage_recipient = self.usage_recipient.clone();
 
-        let fut = Self::query_device_usage(device, device_sessions, usage_recipient)
+        let fut = Self::query_device_usage(device, topic_name, device_sessions, usage_recipient)
             .instrument(span.clone())
             .into_actor(self)
             .map(|_, act, _| act.polling = false);
@@ -80,6 +85,7 @@ impl DeviceUsageActor {
     ))]
     async fn query_device_usage(
         device: Device,
+        topic_name: String,
         device_sessions: DeviceSessions,
         usage_recipient: Recipient<DeviceUsageMessage>,
     ) {
@@ -93,6 +99,7 @@ impl DeviceUsageActor {
             Ok(device_usage) => {
                 let result = usage_recipient.try_send(DeviceUsageMessage {
                     span_context: span.context(),
+                    topic_name,
                     device,
                     device_usage,
                 });

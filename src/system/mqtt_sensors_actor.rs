@@ -14,7 +14,6 @@ use serde::Deserialize;
 use tracing::{Instrument, info, instrument, warn};
 
 use crate::{
-    settings::Sensors,
     system::messages::{GetSensorReadingMessage, SensorReading, StopMessage},
     telemetry::{consumer_span, record_error},
 };
@@ -63,7 +62,7 @@ pub struct MqttSensorsActor {
 
 impl MqttSensorsActor {
     #[instrument(name = "MqttSensorsActor::new", skip_all)]
-    pub fn new(address: String, config: Sensors) -> Result<Self, paho_mqtt::Error> {
+    pub fn new(address: String, topic_name: String) -> Result<Self, paho_mqtt::Error> {
         // No client id, so the broker assigns one: two instances (a rolling update, a local run
         // against the same broker) would otherwise keep evicting each other's session.
         let create_options = CreateOptionsBuilder::new_v3()
@@ -77,7 +76,7 @@ impl MqttSensorsActor {
 
         Ok(Self {
             client,
-            topic_name: config.topic_name,
+            topic_name,
             stream: Some(Box::pin(stream)),
             readings: HashMap::new(),
             stop_requested: false,

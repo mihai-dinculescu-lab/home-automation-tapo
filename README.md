@@ -10,11 +10,11 @@ based on presence and temperature.
 Actor System consisting of:
 
 - Coordinator Actor - makes sure that everything is running as expected
-- Device Usage Actor - reads the device usage and sends it to the Coordinator Actor, which forwards it to the MQTT Actor
+- Device Usage Actor - reads the device usage and sends it to the Coordinator Actor, which forwards it to the MQTT Actor (only when `device_usage` is enabled)
 - Device Session Actor - one per device, runs every request to it on a single session, one at a time
-- MQTT Actor - publishes the data to the MQTT broker
-- MQTT Sensors Actor - subscribes to the sensor readings on the MQTT broker and keeps the latest one per location (only when `mqtt.sensors` is enabled)
-- Thermostat Actor - decides whether a room should be heated and switches the heater plugs
+- MQTT Actor - publishes the data to the MQTT broker (only when `device_usage` or `heating` is enabled)
+- MQTT Sensors Actor - subscribes to the sensor readings on the MQTT broker and keeps the latest one per location (only when `heating` and at least one of its thermostats are enabled)
+- Thermostat Actor - decides whether a room should be heated and switches the heater plugs (only when `heating` and the thermostat are enabled)
 - API Actor - REST API for turning devices on/off and getting their status
 
 ## Usage
@@ -22,6 +22,12 @@ Actor System consisting of:
 Building requires [CMake](https://cmake.org/) and OpenSSL, which are needed by the MQTT client.
 
 Rename and update `settings.sample.yaml` to `settings.yaml`.
+
+The API always runs. The usage polling and the heating are optional sections, `device_usage` and `heating`, each
+switched by its own `enabled`, so a feature can be turned off without removing the rest of its settings; a missing
+section is the same as a disabled one. `mqtt` is only required while one of them is enabled. Every section is
+validated whether it is enabled or not, and a key the service does not know is rejected, so a settings file in the
+shape of an earlier release fails at startup rather than running with a feature dropped.
 
 ```bash
 cargo run
@@ -61,14 +67,14 @@ by requests with the same `device_type`, so a device that the service also polls
 
 ## Sensors
 
-When `mqtt.sensors` is present and `enabled`, the service subscribes to the MQTT topic filter `mqtt.sensors.topic_name`
-(e.g. `sensors/#`) and keeps the latest reading per `location` from JSON payloads with at least
-`{"location": "Living Room", "temperature": 21.4}`. The messages are not retained, so readings are only known from the
-moment the service subscribes. `mqtt.sensors` is optional; leaving it out or setting `enabled: false` skips the subscription.
+While `heating` and at least one of its thermostats are enabled, the service subscribes to the MQTT topic filter
+`heating.sensors_topic_name` (e.g. `sensors/#`) and keeps the latest reading per `location` from JSON payloads with at
+least `{"location": "Living Room", "temperature": 21.4}`. The messages are not retained, so readings are only known
+from the moment the service subscribes.
 
 ## Thermostat
 
-Each enabled entry in `thermostats` is evaluated every `interval_s` seconds under the rule of the active period
+Each enabled entry in `heating.thermostats` is evaluated every `interval_s` seconds under the rule of the active period
 containing the current time. The heaters are turned **on** when a person was detected by the camera in the last
 `presence_window_s` seconds and the latest sensor reading for `sensor_location` is under the period's
 `target_temperature - deadband`. They are turned **off** when nobody was detected, the camera cannot be queried,
@@ -83,10 +89,10 @@ shutdown: the next start asserts the heaters on its first tick.
 The readings are not retained, so none is known right after a start and the heaters are turned off until the first
 one arrives. This also covers plugs left on by a run that crashed.
 
-The readings are the ones kept by the [Sensors](#sensors) subscription, matched on `sensor_location`, so an enabled
-thermostat requires `mqtt.sensors` to be enabled. Person detection is read from the camera's SD card through
-`get_detections`, so it has to be enabled in the Tapo app, and `presence_window_s` is capped at 24 hours by the camera.
-It also has to be at least `interval_s`, otherwise a person detected between two ticks can go unnoticed.
+The readings are the ones kept by the [Sensors](#sensors) subscription, matched on `sensor_location`. Person
+detection is read from the camera's SD card through `get_detections`, so it has to be enabled in the Tapo app, and
+`presence_window_s` is capped at 24 hours by the camera. It also has to be at least `interval_s`, otherwise a person
+detected between two ticks can go unnoticed.
 
 `active_periods` lists the parts of the day in which a thermostat runs, each from `start` (inclusive) to `end`
 (exclusive) as `HH:MM` in the thermostat's `time_zone` (an IANA name such as `Europe/London`); an `end` before
@@ -99,8 +105,8 @@ and so does any gap between two of them, otherwise a period or a gap can pass be
 checked on the local clock, so on the two daylight saving nights a period or gap inside the skipped hour gets no
 tick and one inside the repeated hour runs twice; keep the boundaries away from that hour.
 
-`thermostats` is optional; leaving it out or empty disables the thermostat, and a single entry can be switched off
-with `enabled: false`, which leaves its heaters alone.
+`heating.thermostats` needs at least one entry. `heating.enabled: false` switches every thermostat off, and a single
+entry can be switched off with its own `enabled: false`; either leaves the heaters alone.
 
 ### Safety properties
 
@@ -137,7 +143,7 @@ met yet and are marked as such.
    and alerting on switch failures and on gaps between decisions would close this.
 9. **One controller at a time.** The deployment runs a single replica with the `Recreate` strategy, so a deploy
    stops the old pod before the new one starts and the two never log in to the same plug at once. A local run against
-   the same plugs is the one case this cannot prevent; keep the thermostat `enabled: false` in a local settings file.
+   the same plugs is the one case this cannot prevent; keep `heating.enabled: false` in a local settings file.
 10. **A manual switch is reconciled within one interval.** Every tick commands the heaters: the decision inside the
     period, Off outside it, and the last command within the deadband. A plug switched by hand is therefore corrected
     on the next tick wherever the temperature sits.
@@ -146,9 +152,8 @@ met yet and are marked as such.
     registry outage can keep a replacement pod from starting.
 12. **Configuration cannot silently disable safety.** The settings are validated at startup and the service refuses to
     start on a zero interval, a presence window shorter than the interval, a period or a gap between two of them
-    shorter than the interval, overlapping periods, an empty list of periods, a key it does not know in a
-    thermostat, a period or a heater, a non-finite temperature or deadband, or an enabled thermostat without the
-    sensors.
+    shorter than the interval, overlapping periods, an empty list of periods or thermostats, a key it does not know
+    anywhere in the settings, a non-finite temperature or deadband, or an enabled feature without `mqtt`.
 
 ## Telemetry
 

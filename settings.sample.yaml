@@ -1,59 +1,69 @@
 api:
   host:
   port:
+# the credentials of every Tapo device: the API, the usage polling and the heating
 tapo:
   username:
   password:
-  # how often to fetch the device usage of devices
-  refresh_rate_s:
+# optional, required when device_usage or heating is enabled
 mqtt:
   # tcp://host:port
   address:
+# optional, a missing section is the same as `enabled: false`
+device_usage:
+  # a disabled section starts no polling, and the rest of it is kept as written
+  enabled:
+  # how often to fetch the device usage of devices
+  refresh_rate_s:
+  # topic the usage is published on
   topic_name:
-  # optional, the sensor readings the thermostats use
-  sensors:
-    enabled:
-    # topic filter the sensor readings are received on, e.g. `sensors/#`
-    topic_name:
-devices:
-  - name:
-    ip_address:
-    # set to `false` for plugs that are always on and the time usage becomes irrelevant
-    record_time_usage:
-# optional, an empty or missing list disables the thermostat
-thermostats:
-  - name:
-    # a disabled thermostat is not started and leaves its heaters alone
-    enabled:
-    # IANA name the periods are in, e.g. Europe/London
-    time_zone:
-    # the parts of the day in which the thermostat runs, each with its own rule; outside every
-    # period nothing is queried and the heaters are switched off on every tick. At least one;
-    # periods may abut but not overlap, and a gap between two of them has to last at least
-    # interval_s or not exist at all
-    active_periods:
-      # HH:MM, inclusive
-      - start:
-        # HH:MM, exclusive; an end before the start crosses midnight
-        end:
-        # target in °C
-        target_temperature:
-        # whether the heaters are only switched on while a person is present; `false` heats the
-        # room regardless, e.g. before anyone is up
-        require_presence:
-    # camera whose person detections decide presence
-    camera_ip_address:
-    # matches the `location` field of the sensor payload
-    sensor_location:
-    # P110 plugs switched together
-    heaters:
-      - name:
-        ip_address:
-    # half-width of the band around the target in which the last command is repeated
-    deadband:
-    # a person detected this many seconds ago still counts as present, at least interval_s and at most 86400 (24 hours)
-    presence_window_s:
-    # a reading older than this many seconds is treated as missing, at most 86400 (24 hours)
-    reading_max_age_s:
-    # how often the thermostat is evaluated, in seconds
-    interval_s:
+  # at least one; set `enabled` to `false` to switch the polling off
+  devices:
+    - name:
+      ip_address:
+      # set to `false` for plugs that are always on and the time usage becomes irrelevant
+      record_time_usage:
+# optional, a missing section is the same as `enabled: false`
+heating:
+  # a disabled section starts no thermostat and leaves every heater alone, and the rest of it is
+  # kept as written
+  enabled:
+  # topic filter the sensor readings the thermostats use are received on, e.g. `sensors/#`
+  sensors_topic_name:
+  # at least one; set `enabled` to `false` to switch the heating off
+  thermostats:
+    - name:
+      # a disabled thermostat is not started and leaves its heaters alone
+      enabled:
+      # IANA name the periods are in, e.g. Europe/London
+      time_zone:
+      # the parts of the day in which the thermostat runs, each with its own rule; outside every
+      # period nothing is queried and the heaters are switched off on every tick. At least one;
+      # periods may abut but not overlap, and a gap between two of them has to last at least
+      # interval_s or not exist at all
+      active_periods:
+        # HH:MM, inclusive
+        - start:
+          # HH:MM, exclusive; an end before the start crosses midnight
+          end:
+          # target in °C
+          target_temperature:
+          # whether the heaters are only switched on while a person is present; `false` heats the
+          # room regardless, e.g. before anyone is up
+          require_presence:
+      # camera whose person detections decide presence
+      camera_ip_address:
+      # matches the `location` field of the sensor payload
+      sensor_location:
+      # P110 plugs switched together
+      heaters:
+        - name:
+          ip_address:
+      # half-width of the band around the target in which the last command is repeated
+      deadband:
+      # a person detected this many seconds ago still counts as present, at least interval_s and at most 86400 (24 hours)
+      presence_window_s:
+      # a reading older than this many seconds is treated as missing, at most 86400 (24 hours)
+      reading_max_age_s:
+      # how often the thermostat is evaluated, in seconds
+      interval_s:

@@ -19,17 +19,22 @@ const MAX_READING_MAX_AGE_S: u64 = 24 * 60 * 60;
 /// device hold up a thermostat tick or the shutdown for far longer than either can afford.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+// Unknown keys are rejected on every section, so that a settings file in the shape of an earlier
+// release fails at startup instead of being read with a feature silently dropped.
+
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Api {
     pub host: String,
     pub port: u16,
 }
 
+/// The credentials of every Tapo device: the API, the usage polling and the heating.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Tapo {
     pub username: String,
     pub password: String,
-    pub refresh_rate_s: u64,
 }
 
 impl Tapo {
@@ -40,22 +45,30 @@ impl Tapo {
     }
 }
 
+/// The broker. Each feature that uses it names its own topics.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Mqtt {
+    /// `tcp://host:port`
     pub address: String,
-    pub topic_name: String,
-    /// Optional; the sensor readings are only read when present and enabled.
-    pub sensors: Option<Sensors>,
 }
 
+/// Polls the usage of the devices and publishes it over MQTT.
 #[derive(Debug, Clone, Deserialize)]
-pub struct Sensors {
+#[serde(deny_unknown_fields)]
+pub struct DeviceUsage {
+    /// A disabled section starts no polling, and the rest of it is kept as written.
     pub enabled: bool,
-    /// Topic filter the sensor readings are received on, e.g. `sensors/#`.
+    /// How often the usage of each device is fetched.
+    pub refresh_rate_s: u64,
+    /// Topic the usage is published on.
     pub topic_name: String,
+    /// At least one.
+    pub devices: Vec<Device>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Device {
     pub ip_address: String,
     pub name: String,
@@ -199,15 +212,39 @@ impl Thermostat {
     }
 }
 
+/// Runs the thermostats on the sensor readings received over MQTT.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Heating {
+    /// A disabled section starts no thermostat and leaves every heater alone, and the rest of it
+    /// is kept as written.
+    pub enabled: bool,
+    /// Topic filter the sensor readings are received on, e.g. `sensors/#`.
+    pub sensors_topic_name: String,
+    /// At least one; a single thermostat is switched off with its own `enabled`.
+    pub thermostats: Vec<Thermostat>,
+}
+
+impl Heating {
+    /// The thermostats with `enabled` set, which are started when the section is enabled too.
+    pub fn enabled_thermostats(&self) -> impl Iterator<Item = &Thermostat> {
+        self.thermostats
+            .iter()
+            .filter(|thermostat| thermostat.enabled)
+    }
+}
+
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Settings {
     pub api: Api,
     pub tapo: Tapo,
-    pub mqtt: Mqtt,
-    pub devices: Vec<Device>,
-    /// Optional; an empty list disables the thermostat.
-    #[serde(default)]
-    pub thermostats: Vec<Thermostat>,
+    /// Optional; required when `device_usage` or `heating` is enabled.
+    pub mqtt: Option<Mqtt>,
+    /// Optional; a missing section is the same as a disabled one.
+    pub device_usage: Option<DeviceUsage>,
+    /// Optional; a missing section is the same as a disabled one.
+    pub heating: Option<Heating>,
 }
 
 impl Settings {
@@ -228,23 +265,64 @@ impl Settings {
         Ok(settings)
     }
 
+    /// The device usage section when it is present and enabled.
+    pub fn enabled_device_usage(&self) -> Option<&DeviceUsage> {
+        self.device_usage
+            .as_ref()
+            .filter(|device_usage| device_usage.enabled)
+    }
+
+    /// The heating section when it is present and enabled.
+    pub fn enabled_heating(&self) -> Option<&Heating> {
+        self.heating.as_ref().filter(|heating| heating.enabled)
+    }
+
+    /// Every section is validated whether it is enabled or not, so that a mistake in a disabled
+    /// one surfaces when it is written rather than when it is switched on.
+    ///
     /// Rejects values that deserialize fine but would fail later, where the cause is harder to
-    /// trace back to the settings: a zero interval busy-loops its actor's ticks, a presence
-    /// window shorter than the interval misses anyone detected early in it and an empty one
-    /// never sees anyone, a presence window over 24 hours is refused by the camera on
-    /// every tick, a zero reading age makes every reading stale and an oversized one overflows
-    /// the age arithmetic, a negative deadband inverts the rules, a non-finite temperature makes
-    /// every comparison false, a duplicate key makes the coordinator skip an entry, a thermostat
-    /// without the sensors would never see a reading, one without a period would never heat, an
-    /// active period that starts when it ends is either empty or the whole day, which the
-    /// thermostat cannot tell apart, one shorter than the interval can pass between two ticks
-    /// without either landing in it, two that overlap leave the rule for the overlap to the
-    /// order of the list, and a gap between two periods shorter than the interval can pass
-    /// between two ticks without the `Off` handover ever happening.
+    /// trace back to the settings: an enabled feature without the broker it publishes to or
+    /// reads from cannot run, an empty list of devices or thermostats is a disabled section
+    /// spelled another way, a zero interval busy-loops its actor's ticks, a presence window
+    /// shorter than the interval misses anyone detected early in it and an empty one never sees
+    /// anyone, a presence window over 24 hours is refused by the camera on every tick, a zero
+    /// reading age makes every reading stale and an oversized one overflows the age arithmetic, a
+    /// negative deadband inverts the rules, a non-finite temperature makes every comparison
+    /// false, a duplicate key makes the coordinator skip an entry, a thermostat without a period
+    /// would never heat, an active period that starts when it ends is either empty or the whole
+    /// day, which the thermostat cannot tell apart, one shorter than the interval can pass
+    /// between two ticks without either landing in it, two that overlap leave the rule for the
+    /// overlap to the order of the list, and a gap between two periods shorter than the interval
+    /// can pass between two ticks without the `Off` handover ever happening.
     fn validate(&self) -> Result<(), anyhow::Error> {
         ensure!(
-            self.tapo.refresh_rate_s > 0,
-            "tapo.refresh_rate_s must be greater than 0"
+            self.mqtt.is_some()
+                || (self.enabled_device_usage().is_none() && self.enabled_heating().is_none()),
+            "mqtt must be set when device_usage or heating is enabled"
+        );
+
+        if let Some(device_usage) = &self.device_usage {
+            device_usage.validate()?;
+        }
+
+        if let Some(heating) = &self.heating {
+            heating.validate()?;
+        }
+
+        Ok(())
+    }
+}
+
+impl DeviceUsage {
+    fn validate(&self) -> Result<(), anyhow::Error> {
+        ensure!(
+            self.refresh_rate_s > 0,
+            "device_usage.refresh_rate_s must be greater than 0"
+        );
+        ensure!(
+            !self.devices.is_empty(),
+            "device_usage.devices must have at least one entry; set device_usage.enabled to \
+             false to switch the polling off"
         );
 
         let mut ip_addresses = HashSet::new();
@@ -256,7 +334,17 @@ impl Settings {
             );
         }
 
-        let sensors_enabled = self.mqtt.sensors.as_ref().is_some_and(|s| s.enabled);
+        Ok(())
+    }
+}
+
+impl Heating {
+    fn validate(&self) -> Result<(), anyhow::Error> {
+        ensure!(
+            !self.thermostats.is_empty(),
+            "heating.thermostats must have at least one entry; set heating.enabled to false to \
+             switch the heating off"
+        );
 
         let mut names = HashSet::new();
         for thermostat in &self.thermostats {
@@ -293,11 +381,6 @@ impl Settings {
             ensure!(
                 thermostat.deadband >= 0.0,
                 "Thermostat '{name}': deadband must not be negative"
-            );
-            ensure!(
-                !thermostat.enabled || sensors_enabled,
-                "Thermostat '{name}' is enabled but mqtt.sensors is not, so it would never see \
-                 a reading"
             );
             thermostat.validate_active_periods()?;
         }
@@ -421,19 +504,38 @@ mod tests {
             tapo: Tapo {
                 username: String::new(),
                 password: String::new(),
-                refresh_rate_s: 600,
             },
-            mqtt: Mqtt {
+            mqtt: Some(Mqtt {
                 address: "tcp://localhost:1883".to_string(),
+            }),
+            device_usage: Some(DeviceUsage {
+                enabled: true,
+                refresh_rate_s: 600,
                 topic_name: "devices/tapo".to_string(),
-                sensors: Some(Sensors {
-                    enabled: true,
-                    topic_name: "sensors/#".to_string(),
-                }),
-            },
-            devices: vec![],
-            thermostats: vec![thermostat("Living Room")],
+                devices: vec![device("192.168.1.100")],
+            }),
+            heating: Some(Heating {
+                enabled: true,
+                sensors_topic_name: "sensors/#".to_string(),
+                thermostats: vec![thermostat("Living Room")],
+            }),
         }
+    }
+
+    fn device(ip_address: &str) -> Device {
+        Device {
+            ip_address: ip_address.to_string(),
+            name: "Plug".to_string(),
+            record_time_usage: false,
+        }
+    }
+
+    fn device_usage(settings: &mut Settings) -> &mut DeviceUsage {
+        settings.device_usage.as_mut().unwrap()
+    }
+
+    fn heating(settings: &mut Settings) -> &mut Heating {
+        settings.heating.as_mut().unwrap()
     }
 
     fn error(settings: &Settings) -> String {
@@ -451,20 +553,16 @@ mod tests {
     #[test]
     fn zero_refresh_rate_is_rejected() {
         let mut settings = settings();
-        settings.tapo.refresh_rate_s = 0;
+        device_usage(&mut settings).refresh_rate_s = 0;
 
         assert!(error(&settings).contains("refresh_rate_s"));
     }
 
     #[test]
     fn duplicate_device_ip_address_is_rejected() {
-        let device = Device {
-            ip_address: "192.168.1.100".to_string(),
-            name: "Plug".to_string(),
-            record_time_usage: false,
-        };
         let mut settings = settings();
-        settings.devices = vec![device.clone(), device];
+        device_usage(&mut settings).devices =
+            vec![device("192.168.1.100"), device("192.168.1.100")];
 
         assert!(error(&settings).contains("192.168.1.100"));
     }
@@ -472,7 +570,9 @@ mod tests {
     #[test]
     fn duplicate_thermostat_name_is_rejected() {
         let mut settings = settings();
-        settings.thermostats.push(thermostat("Living Room"));
+        heating(&mut settings)
+            .thermostats
+            .push(thermostat("Living Room"));
 
         assert!(error(&settings).contains("Duplicate thermostat name"));
     }
@@ -480,7 +580,7 @@ mod tests {
     #[test]
     fn zero_interval_is_rejected() {
         let mut settings = settings();
-        settings.thermostats[0].interval_s = 0;
+        heating(&mut settings).thermostats[0].interval_s = 0;
 
         assert!(error(&settings).contains("interval_s"));
     }
@@ -489,7 +589,7 @@ mod tests {
     fn presence_window_shorter_than_interval_is_rejected() {
         for presence_window_s in [0, 299] {
             let mut settings = settings();
-            settings.thermostats[0].presence_window_s = presence_window_s;
+            heating(&mut settings).thermostats[0].presence_window_s = presence_window_s;
 
             assert!(
                 error(&settings).contains("presence_window_s must be at least interval_s"),
@@ -501,7 +601,7 @@ mod tests {
     #[test]
     fn presence_window_equal_to_interval_passes() {
         let mut settings = settings();
-        settings.thermostats[0].presence_window_s = 300;
+        heating(&mut settings).thermostats[0].presence_window_s = 300;
 
         settings.validate().unwrap();
     }
@@ -509,7 +609,7 @@ mod tests {
     #[test]
     fn presence_window_over_a_day_is_rejected() {
         let mut settings = settings();
-        settings.thermostats[0].presence_window_s = MAX_PRESENCE_WINDOW_S + 1;
+        heating(&mut settings).thermostats[0].presence_window_s = MAX_PRESENCE_WINDOW_S + 1;
 
         assert!(error(&settings).contains("presence_window_s"));
     }
@@ -517,7 +617,7 @@ mod tests {
     #[test]
     fn zero_reading_max_age_is_rejected() {
         let mut settings = settings();
-        settings.thermostats[0].reading_max_age_s = 0;
+        heating(&mut settings).thermostats[0].reading_max_age_s = 0;
 
         assert!(error(&settings).contains("reading_max_age_s must be greater than 0"));
     }
@@ -526,7 +626,7 @@ mod tests {
     fn reading_max_age_over_a_day_is_rejected() {
         for reading_max_age_s in [MAX_READING_MAX_AGE_S + 1, u64::MAX] {
             let mut settings = settings();
-            settings.thermostats[0].reading_max_age_s = reading_max_age_s;
+            heating(&mut settings).thermostats[0].reading_max_age_s = reading_max_age_s;
 
             assert!(
                 error(&settings).contains("reading_max_age_s must be at most"),
@@ -539,7 +639,8 @@ mod tests {
     fn non_finite_target_temperature_is_rejected() {
         for target_temperature in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let mut settings = settings();
-            settings.thermostats[0].active_periods[0].target_temperature = target_temperature;
+            heating(&mut settings).thermostats[0].active_periods[0].target_temperature =
+                target_temperature;
 
             assert!(
                 error(&settings).contains("finite target_temperature"),
@@ -552,7 +653,7 @@ mod tests {
     fn non_finite_deadband_is_rejected() {
         for deadband in [f64::NAN, f64::INFINITY] {
             let mut settings = settings();
-            settings.thermostats[0].deadband = deadband;
+            heating(&mut settings).thermostats[0].deadband = deadband;
 
             assert!(
                 error(&settings).contains("deadband must be a finite number"),
@@ -564,34 +665,110 @@ mod tests {
     #[test]
     fn negative_deadband_is_rejected() {
         let mut settings = settings();
-        settings.thermostats[0].deadband = -0.25;
+        heating(&mut settings).thermostats[0].deadband = -0.25;
 
         assert!(error(&settings).contains("deadband"));
     }
 
     #[test]
-    fn enabled_thermostat_without_sensors_is_rejected() {
-        for sensors in [
-            None,
-            Some(Sensors {
-                enabled: false,
-                topic_name: "sensors/#".to_string(),
-            }),
-        ] {
+    fn empty_devices_are_rejected_even_when_disabled() {
+        for enabled in [true, false] {
             let mut settings = settings();
-            settings.mqtt.sensors = sensors;
+            device_usage(&mut settings).enabled = enabled;
+            device_usage(&mut settings).devices = vec![];
 
-            assert!(error(&settings).contains("mqtt.sensors"));
+            assert!(
+                error(&settings).contains("device_usage.devices must have at least one entry"),
+                "enabled {enabled}"
+            );
         }
     }
 
     #[test]
-    fn disabled_thermostat_without_sensors_passes() {
+    fn empty_thermostats_are_rejected_even_when_disabled() {
+        for enabled in [true, false] {
+            let mut settings = settings();
+            heating(&mut settings).enabled = enabled;
+            heating(&mut settings).thermostats = vec![];
+
+            assert!(
+                error(&settings).contains("heating.thermostats must have at least one entry"),
+                "enabled {enabled}"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_device_usage_is_still_validated() {
         let mut settings = settings();
-        settings.mqtt.sensors = None;
-        settings.thermostats[0].enabled = false;
+        device_usage(&mut settings).enabled = false;
+        device_usage(&mut settings).refresh_rate_s = 0;
+
+        assert!(error(&settings).contains("refresh_rate_s"));
+    }
+
+    #[test]
+    fn disabled_heating_is_still_validated() {
+        let mut settings = settings();
+        heating(&mut settings).enabled = false;
+        heating(&mut settings).thermostats[0].interval_s = 0;
+
+        assert!(error(&settings).contains("interval_s"));
+    }
+
+    #[test]
+    fn enabled_feature_without_mqtt_is_rejected() {
+        for (device_usage_enabled, heating_enabled) in [(true, false), (false, true), (true, true)]
+        {
+            let mut settings = settings();
+            settings.mqtt = None;
+            device_usage(&mut settings).enabled = device_usage_enabled;
+            heating(&mut settings).enabled = heating_enabled;
+
+            assert!(
+                error(&settings).contains("mqtt must be set"),
+                "device_usage {device_usage_enabled}, heating {heating_enabled}"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_features_without_mqtt_pass() {
+        let mut settings = settings();
+        settings.mqtt = None;
+        device_usage(&mut settings).enabled = false;
+        heating(&mut settings).enabled = false;
 
         settings.validate().unwrap();
+
+        settings.device_usage = None;
+        settings.heating = None;
+
+        settings.validate().unwrap();
+    }
+
+    #[test]
+    fn only_thermostats_enabled_in_an_enabled_section_are_started() {
+        let mut settings = settings();
+        let mut disabled = thermostat("Bedroom");
+        disabled.enabled = false;
+        heating(&mut settings).thermostats.push(disabled);
+
+        // As the coordinator picks them.
+        let names = |settings: &Settings| {
+            settings
+                .enabled_heating()
+                .into_iter()
+                .flat_map(|heating| heating.enabled_thermostats())
+                .map(|thermostat| thermostat.name.clone())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(names(&settings), ["Living Room"]);
+
+        heating(&mut settings).enabled = false;
+
+        assert!(names(&settings).is_empty());
     }
 
     fn period(start: &str, end: &str) -> ActivePeriod {
@@ -614,7 +791,7 @@ mod tests {
 
     fn with_periods(periods: Vec<ActivePeriod>) -> Settings {
         let mut settings = settings();
-        settings.thermostats[0].active_periods = periods;
+        heating(&mut settings).thermostats[0].active_periods = periods;
         settings
     }
 
@@ -752,12 +929,11 @@ mod tests {
 
     const YAML_HEAD: &str = r#"
 api: { host: 127.0.0.1, port: 8080 }
-tapo: { username: "", password: "", refresh_rate_s: 600 }
-mqtt:
-  address: tcp://localhost:1883
-  topic_name: devices/tapo
-  sensors: { enabled: true, topic_name: "sensors/#" }
-devices: []
+tapo: { username: "", password: "" }
+mqtt: { address: tcp://localhost:1883 }
+heating:
+  enabled: true
+  sensors_topic_name: "sensors/#"
 "#;
 
     fn parse(yaml: &str) -> Result<Settings, config::ConfigError> {
@@ -772,32 +948,32 @@ devices: []
     fn active_periods_are_read_from_yaml() {
         let yaml = format!(
             "{YAML_HEAD}
-thermostats:
-  - name: Living Room
-    enabled: true
-    time_zone: Europe/London
-    active_periods:
-      - start: \"05:45\"
-        end: \"07:00\"
-        target_temperature: 21.0
-        require_presence: false
-      - start: \"07:00\"
-        end: \"22:00\"
-        target_temperature: 22.0
-        require_presence: true
-    camera_ip_address: 192.168.1.154
-    sensor_location: Living Room
-    deadband: 0.25
-    presence_window_s: 900
-    reading_max_age_s: 900
-    interval_s: 300
+  thermostats:
+    - name: Living Room
+      enabled: true
+      time_zone: Europe/London
+      active_periods:
+        - start: \"05:45\"
+          end: \"07:00\"
+          target_temperature: 21.0
+          require_presence: false
+        - start: \"07:00\"
+          end: \"22:00\"
+          target_temperature: 22.0
+          require_presence: true
+      camera_ip_address: 192.168.1.154
+      sensor_location: Living Room
+      deadband: 0.25
+      presence_window_s: 900
+      reading_max_age_s: 900
+      interval_s: 300
 "
         );
 
         let settings = parse(&yaml).unwrap();
         settings.validate().unwrap();
 
-        let thermostat = &settings.thermostats[0];
+        let thermostat = &settings.heating.unwrap().thermostats[0];
         assert_eq!(thermostat.time_zone, chrono_tz::Europe::London);
         assert_eq!(thermostat.active_periods.len(), 2);
 
@@ -818,20 +994,20 @@ thermostats:
     fn active_period_without_require_presence_is_rejected() {
         let yaml = format!(
             "{YAML_HEAD}
-thermostats:
-  - name: Living Room
-    enabled: true
-    time_zone: Europe/London
-    active_periods:
-      - start: \"07:00\"
-        end: \"22:00\"
-        target_temperature: 22.0
-    camera_ip_address: 192.168.1.154
-    sensor_location: Living Room
-    deadband: 0.25
-    presence_window_s: 900
-    reading_max_age_s: 900
-    interval_s: 300
+  thermostats:
+    - name: Living Room
+      enabled: true
+      time_zone: Europe/London
+      active_periods:
+        - start: \"07:00\"
+          end: \"22:00\"
+          target_temperature: 22.0
+      camera_ip_address: 192.168.1.154
+      sensor_location: Living Room
+      deadband: 0.25
+      presence_window_s: 900
+      reading_max_age_s: 900
+      interval_s: 300
 "
         );
 
@@ -846,22 +1022,22 @@ thermostats:
     fn unknown_key_in_an_active_period_is_rejected() {
         let yaml = format!(
             "{YAML_HEAD}
-thermostats:
-  - name: Living Room
-    enabled: true
-    time_zone: Europe/London
-    active_periods:
-      - start: \"07:00\"
-        end: \"22:00\"
-        target_temperature: 22.0
-        require_presence: true
-        deadband: 0.5
-    camera_ip_address: 192.168.1.154
-    sensor_location: Living Room
-    deadband: 0.25
-    presence_window_s: 900
-    reading_max_age_s: 900
-    interval_s: 300
+  thermostats:
+    - name: Living Room
+      enabled: true
+      time_zone: Europe/London
+      active_periods:
+        - start: \"07:00\"
+          end: \"22:00\"
+          target_temperature: 22.0
+          require_presence: true
+          deadband: 0.5
+      camera_ip_address: 192.168.1.154
+      sensor_location: Living Room
+      deadband: 0.25
+      presence_window_s: 900
+      reading_max_age_s: 900
+      interval_s: 300
 "
         );
 
@@ -878,26 +1054,26 @@ thermostats:
         // the target on the thermostat. Both keys have to fail rather than be ignored.
         let yaml = format!(
             "{YAML_HEAD}
-thermostats:
-  - name: Living Room
-    enabled: true
-    time_zone: Europe/London
-    active_periods:
-      - start: \"07:00\"
-        end: \"22:00\"
-        target_temperature: 22.0
-        require_presence: true
-    active_period:
-      start: \"07:30\"
-      end: \"22:00\"
+  thermostats:
+    - name: Living Room
+      enabled: true
       time_zone: Europe/London
-    camera_ip_address: 192.168.1.154
-    sensor_location: Living Room
-    target_temperature: 22.0
-    deadband: 0.25
-    presence_window_s: 900
-    reading_max_age_s: 900
-    interval_s: 300
+      active_periods:
+        - start: \"07:00\"
+          end: \"22:00\"
+          target_temperature: 22.0
+          require_presence: true
+      active_period:
+        start: \"07:30\"
+        end: \"22:00\"
+        time_zone: Europe/London
+      camera_ip_address: 192.168.1.154
+      sensor_location: Living Room
+      target_temperature: 22.0
+      deadband: 0.25
+      presence_window_s: 900
+      reading_max_age_s: 900
+      interval_s: 300
 "
         );
 
@@ -906,6 +1082,80 @@ thermostats:
             error.to_string().contains("unknown field"),
             "unexpected error: {error}"
         );
+    }
+
+    const YAML_BASE: &str = r#"
+api: { host: 127.0.0.1, port: 8080 }
+tapo: { username: "", password: "" }
+"#;
+
+    #[test]
+    fn missing_sections_are_read_as_disabled() {
+        let settings = parse(YAML_BASE).unwrap();
+        settings.validate().unwrap();
+
+        assert!(settings.mqtt.is_none());
+        assert!(settings.enabled_device_usage().is_none());
+        assert!(settings.enabled_heating().is_none());
+    }
+
+    #[test]
+    fn section_without_enabled_is_rejected() {
+        for section in [
+            "device_usage: { refresh_rate_s: 600, topic_name: devices/tapo, devices: [] }",
+            "heating: { sensors_topic_name: \"sensors/#\", thermostats: [] }",
+        ] {
+            let error = parse(&format!("{YAML_BASE}{section}\n"))
+                .expect_err("enabled is required")
+                .to_string();
+
+            assert!(error.contains("enabled"), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn heating_without_thermostats_is_rejected() {
+        let yaml = format!(
+            "{YAML_BASE}heating: {{ enabled: false, sensors_topic_name: \"sensors/#\" }}\n"
+        );
+
+        let error = parse(&yaml)
+            .expect_err("thermostats is required")
+            .to_string();
+        assert!(error.contains("thermostats"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn settings_in_the_old_shape_are_rejected() {
+        // The keys of the release before the sections: the polling rate with the credentials,
+        // the usage topic and the sensors with the broker, and the devices and thermostats at
+        // the top. Each has to fail rather than be ignored.
+        for yaml in [
+            "api: { host: 127.0.0.1, port: 8080 }\n\
+             tapo: { username: \"\", password: \"\", refresh_rate_s: 600 }\n",
+            "api: { host: 127.0.0.1, port: 8080 }\n\
+             tapo: { username: \"\", password: \"\" }\n\
+             mqtt: { address: tcp://localhost:1883, topic_name: devices/tapo }\n",
+            "api: { host: 127.0.0.1, port: 8080 }\n\
+             tapo: { username: \"\", password: \"\" }\n\
+             mqtt:\n  address: tcp://localhost:1883\n  \
+             sensors: { enabled: true, topic_name: \"sensors/#\" }\n",
+            "api: { host: 127.0.0.1, port: 8080 }\n\
+             tapo: { username: \"\", password: \"\" }\n\
+             devices: []\n",
+            "api: { host: 127.0.0.1, port: 8080 }\n\
+             tapo: { username: \"\", password: \"\" }\n\
+             thermostats: []\n",
+        ] {
+            let error = parse(yaml)
+                .expect_err("unknown keys are rejected")
+                .to_string();
+
+            assert!(
+                error.contains("unknown field"),
+                "unexpected error: {error}\n{yaml}"
+            );
+        }
     }
 
     #[test]

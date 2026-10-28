@@ -34,8 +34,8 @@ const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 /// delivered once the connection is back and lost if the process exits before that.
 const MAX_BUFFERED_MESSAGES: i32 = 100;
 
+/// Publishes to the broker for every feature; each message names its own topic.
 pub struct MqttActor {
-    config: Mqtt,
     client: AsyncClient,
     publishes_in_flight: usize,
     stop_requested: bool,
@@ -55,7 +55,6 @@ impl MqttActor {
         let client = AsyncClient::new(options).inspect_err(|e| record_error!(e))?;
 
         Ok(Self {
-            config,
             client,
             publishes_in_flight: 0,
             stop_requested: false,
@@ -212,20 +211,24 @@ impl Handler<DeviceUsageMessage> for MqttActor {
         }
 
         let client = self.client.clone();
-        let topic_name = self.config.topic_name.clone();
 
         self.publishes_in_flight += 1;
 
-        let fut = Self::send_mqtt_message(message.device, message.device_usage, client, topic_name)
-            .instrument(span.clone())
-            .into_actor(self)
-            .map(|_, act, ctx| {
-                act.publishes_in_flight -= 1;
+        let fut = Self::send_mqtt_message(
+            message.device,
+            message.device_usage,
+            client,
+            message.topic_name,
+        )
+        .instrument(span.clone())
+        .into_actor(self)
+        .map(|_, act, ctx| {
+            act.publishes_in_flight -= 1;
 
-                if act.stop_requested && act.publishes_in_flight == 0 {
-                    act.stop(ctx);
-                }
-            });
+            if act.stop_requested && act.publishes_in_flight == 0 {
+                act.stop(ctx);
+            }
+        });
 
         ctx.spawn(fut);
     }
