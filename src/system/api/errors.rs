@@ -8,6 +8,9 @@ pub enum ApiError {
 
     #[display("BadRequest: {}", _0)]
     BadRequest(String),
+
+    #[display("Service Unavailable")]
+    ServiceUnavailable,
 }
 
 impl ResponseError for ApiError {
@@ -17,6 +20,9 @@ impl ResponseError for ApiError {
                 HttpResponse::InternalServerError().json("Internal Server Error")
             }
             ApiError::BadRequest(message) => HttpResponse::BadRequest().json(message),
+            ApiError::ServiceUnavailable => {
+                HttpResponse::ServiceUnavailable().json("Service Unavailable")
+            }
         }
     }
 }

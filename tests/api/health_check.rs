@@ -37,13 +37,16 @@ async fn health_check_fails_when_the_coordinator_has_stopped() {
     // Arrange
     let app = TestApp::new().await;
 
-    app.coordinator
+    app.coordinator_addr
         .send(StopMessage)
         .await
         .expect("Failed to stop the coordinator stub");
-    tokio::time::timeout(Duration::from_secs(1), wait_until_stopped(&app.coordinator))
-        .await
-        .expect("The coordinator stub did not stop");
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        wait_until_stopped(&app.coordinator_addr),
+    )
+    .await
+    .expect("The coordinator stub did not stop");
 
     // Act & Assert
     assert_unavailable(&app).await;

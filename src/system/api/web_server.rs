@@ -9,7 +9,7 @@ use actix_web::{
 };
 use tracing_actix_web::TracingLogger;
 
-use crate::system::{api::handlers, devices::Devices, messages::ProbeMessage};
+use crate::system::{api::handlers, devices::DeviceSessions, messages::ProbeMessage};
 
 pub struct WebServer {
     port: u16,
@@ -17,26 +17,26 @@ pub struct WebServer {
 }
 
 impl WebServer {
-    /// `coordinator` answers the health check's probes.
+    /// `probe_recipient`, the coordinator in production, answers the health check's probes.
     pub async fn new(
         host: &str,
         port: u16,
-        devices: Devices,
-        coordinator: Recipient<ProbeMessage>,
+        device_sessions: DeviceSessions,
+        probe_recipient: Recipient<ProbeMessage>,
     ) -> io::Result<Self> {
         let address = format!("{host}:{port}",);
 
         let listener = TcpListener::bind(address)?;
         let port = listener.local_addr()?.port();
 
-        let devices = web::Data::new(devices);
-        let coordinator = web::Data::new(coordinator);
+        let device_sessions = web::Data::new(device_sessions);
+        let probe_recipient = web::Data::new(probe_recipient);
 
         let server = HttpServer::new(move || {
             App::new()
                 .wrap(TracingLogger::default())
-                .app_data(devices.clone())
-                .app_data(coordinator.clone())
+                .app_data(device_sessions.clone())
+                .app_data(probe_recipient.clone())
                 .route("/health-check", web::get().to(handlers::health_check))
                 .service(
                     web::resource("/device")

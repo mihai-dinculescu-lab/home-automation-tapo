@@ -10,7 +10,8 @@ based on presence and temperature.
 Actor System consisting of:
 
 - Coordinator Actor - makes sure that everything is running as expected
-- Device Actor - reads the device usage and sends it to the Coordinator Actor, which forwards it to the MQTT Actor
+- Device Usage Actor - reads the device usage and sends it to the Coordinator Actor, which forwards it to the MQTT Actor
+- Device Session Actor - one per device, runs every request to it on a single session, one at a time
 - MQTT Actor - publishes the data to the MQTT broker
 - MQTT Sensors Actor - subscribes to the sensor readings on the MQTT broker and keeps the latest one per location (only when `mqtt.sensors` is enabled)
 - Thermostat Actor - decides whether a room should be heated and switches the heater plugs
@@ -43,10 +44,11 @@ without `state.on` changes nothing and reports the state the device is in.
 
 Every device has a single session, shared by the API, the usage polling and the thermostat, and one request runs
 on it at a time: a Tapo device keeps one session, and a login while another request is in progress fails both.
-The session is kept between requests. One that the device no longer accepts, because it expired or a cancelled
-request left it out of step, is reopened and the request retried once; any other failure drops it, so that the
-next request logs in afresh. A session is only reused by requests with the same `device_type`, so a device that
-the service also polls is best addressed as `plug_energy_monitoring`.
+The session is kept between requests. One that the device no longer accepts, because it expired, is reopened and
+the request retried once; any other failure drops it, so that the next request logs in afresh. A request that has
+started is finished even if its caller gives up, so the device is never left mid-request. A session is only reused
+by requests with the same `device_type`, so a device that the service also polls is best addressed as
+`plug_energy_monitoring`.
 
 | `device_type`            | Devices          |
 | ------------------------ | ---------------- |

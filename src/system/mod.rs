@@ -1,10 +1,10 @@
 pub mod api;
 pub mod coordinator_actor;
-mod device_actor;
+mod device_usage_actor;
 pub mod devices;
 mod messages;
 mod mqtt_actor;
 mod mqtt_sensors_actor;
 mod thermostat;
 
-pub use messages::{ProbeMessage, StopMessage};
+pub use messages::{GetDeviceSessionMessage, ProbeMessage, StopMessage};

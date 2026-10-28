@@ -4,12 +4,11 @@ use std::time::Duration;
 use actix::Recipient;
 use actix_web::http::StatusCode;
 use actix_web::{HttpResponse, web};
-use futures_util::FutureExt as _;
 use serde::{Deserialize, Serialize};
 use tracing::{instrument, warn};
 
 use crate::system::api::errors::ApiError;
-use crate::system::devices::{DeviceType, Devices, Error as DeviceError};
+use crate::system::devices::{DeviceSessions, DeviceType, Error as DeviceError};
 use crate::system::messages::ProbeMessage;
 use crate::telemetry::record_error;
 
@@ -66,10 +65,10 @@ pub struct DeviceResponse {
 /// runs on has got stuck (a timeout). The round trip is what lets Kubernetes restart the pod in
 /// either case.
 #[instrument(name = "health_check", skip_all)]
-pub async fn health_check(coordinator: web::Data<Recipient<ProbeMessage>>) -> HttpResponse {
+pub async fn health_check(probe_recipient: web::Data<Recipient<ProbeMessage>>) -> HttpResponse {
     // The timeout wraps the whole send rather than using actix's own, which only starts once
     // the message has been queued: a full mailbox would otherwise hang the probe for good.
-    match tokio::time::timeout(PROBE_TIMEOUT, coordinator.send(ProbeMessage)).await {
+    match tokio::time::timeout(PROBE_TIMEOUT, probe_recipient.send(ProbeMessage)).await {
         Ok(Ok(())) => {
             let body = ApiStatusResponse::new(StatusCode::OK, "OK");
 
@@ -96,13 +95,11 @@ fn coordinator_unavailable<E: Error>(e: &E) -> HttpResponse {
     device.device_type = ?device.device_type,
 ))]
 pub async fn get_device(
-    devices: web::Data<Devices>,
+    device_sessions: web::Data<DeviceSessions>,
     device: web::Json<GetDevicePayload>,
 ) -> Result<HttpResponse, ApiError> {
-    let on = devices
-        .run(device.device_type, &device.ip_address, |handler| {
-            handler.device_on().boxed_local()
-        })
+    let on = device_sessions
+        .device_on(device.device_type, &device.ip_address)
         .await
         .map_err(api_error)?;
 
@@ -120,26 +117,25 @@ pub async fn get_device(
     device.state.on = ?device.state.on,
 ))]
 pub async fn set_device(
-    devices: web::Data<Devices>,
+    device_sessions: web::Data<DeviceSessions>,
     device: web::Json<SetDevicePayload>,
 ) -> Result<HttpResponse, ApiError> {
-    let on = device.state.on;
+    let (device_type, ip_address) = (device.device_type, &device.ip_address);
 
-    let on = devices
-        .run(device.device_type, &device.ip_address, move |handler| {
-            async move {
-                match on {
-                    Some(true) => handler.on().await.map(|_| true),
-                    Some(false) => handler.off().await.map(|_| false),
-                    // Without a state to set, the device is asked for its state instead, so that
-                    // an unreachable one is still reported.
-                    None => handler.device_on().await,
-                }
-            }
-            .boxed_local()
-        })
-        .await
-        .map_err(api_error)?;
+    let on = match device.state.on {
+        Some(true) => device_sessions
+            .turn_on(device_type, ip_address)
+            .await
+            .map(|()| true),
+        Some(false) => device_sessions
+            .turn_off(device_type, ip_address)
+            .await
+            .map(|()| false),
+        // Without a state to set, the device is asked for its state instead, so that an
+        // unreachable one is still reported.
+        None => device_sessions.device_on(device_type, ip_address).await,
+    }
+    .map_err(api_error)?;
 
     let result = DeviceResponse {
         ip_address: device.ip_address.clone(),
@@ -152,13 +148,25 @@ pub async fn set_device(
 /// A failed login is the client's error, e.g. a wrong address, so the request span isn't marked
 /// as failed. So is a device that cannot be reached on a session already open, since it fails
 /// the same way whether or not a session is cached; anything else a device answered is ours.
+///
+/// A shutdown is expected, so it isn't marked as failed either; a session actor that stopped
+/// without being asked to is. Both are a `503`, since the request may succeed once the service
+/// is back.
 fn api_error(e: DeviceError) -> ApiError {
     match &e {
         DeviceError::Login(cause) | DeviceError::Request(cause @ tapo::Error::Http(_)) => {
             warn!(error = %cause, "Failed to connect to the device");
             ApiError::BadRequest("Failed to connect to the device".to_string())
         }
-        _ => {
+        DeviceError::ShuttingDown => {
+            warn!(error = %e, "Refused a device request");
+            ApiError::ServiceUnavailable
+        }
+        DeviceError::Unavailable(_) => {
+            record_error!(&e);
+            ApiError::ServiceUnavailable
+        }
+        DeviceError::Request(_) => {
             record_error!(&e);
             ApiError::InternalServerError
         }

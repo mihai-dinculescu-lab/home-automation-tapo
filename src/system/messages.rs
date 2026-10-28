@@ -1,9 +1,11 @@
-use actix::Message;
+use actix::{Addr, Message};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tapo::responses::DeviceUsageEnergyMonitoringResult;
 
 use crate::settings::Device;
+use crate::system::devices::device_session_actor::DeviceSessionActor;
+use crate::system::devices::{DeviceType, Error as DeviceError};
 
 #[derive(Debug, Message)]
 #[rtype(result = "()")]
@@ -29,6 +31,45 @@ pub struct SensorReading {
 pub struct GetSensorReadingMessage {
     pub span_context: opentelemetry::Context,
     pub location: String,
+}
+
+/// Asks the coordinator for the session actor of the device at `ip_address`, which it creates
+/// on first use. `None` once the service is shutting down. Not traced: the lookup does nothing
+/// slow, and the request it precedes carries the caller's span.
+#[derive(Debug, Message)]
+#[rtype(result = "Option<Addr<DeviceSessionActor>>")]
+pub struct GetDeviceSessionMessage {
+    pub ip_address: String,
+}
+
+/// The requests run on a device's session, sent through `DeviceSessions`. The session is only
+/// reused for the `device_type` it was logged in as.
+#[derive(Debug, Message)]
+#[rtype(result = "Result<(), DeviceError>")]
+pub struct TurnOnMessage {
+    pub span_context: opentelemetry::Context,
+    pub device_type: DeviceType,
+}
+
+#[derive(Debug, Message)]
+#[rtype(result = "Result<(), DeviceError>")]
+pub struct TurnOffMessage {
+    pub span_context: opentelemetry::Context,
+    pub device_type: DeviceType,
+}
+
+#[derive(Debug, Message)]
+#[rtype(result = "Result<bool, DeviceError>")]
+pub struct GetDeviceOnMessage {
+    pub span_context: opentelemetry::Context,
+    pub device_type: DeviceType,
+}
+
+#[derive(Debug, Message)]
+#[rtype(result = "Result<DeviceUsageEnergyMonitoringResult, DeviceError>")]
+pub struct GetDeviceUsageMessage {
+    pub span_context: opentelemetry::Context,
+    pub device_type: DeviceType,
 }
 
 #[derive(Debug, Message)]

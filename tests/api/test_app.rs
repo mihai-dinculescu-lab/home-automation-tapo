@@ -1,7 +1,8 @@
 use actix::{Actor, ActorContext, Addr, Context, Handler, ResponseFuture};
-use home_automation_tapo::{
-    settings::Tapo,
-    system::{ProbeMessage, StopMessage, api::web_server::WebServer, devices::Devices},
+use home_automation_tapo::system::{
+    GetDeviceSessionMessage, ProbeMessage, StopMessage,
+    api::web_server::WebServer,
+    devices::{DeviceSessions, device_session_actor::DeviceSessionActor},
 };
 
 /// Stands in for the coordinator behind `/health-check`: it answers every probe, or none.
@@ -33,18 +34,23 @@ impl Handler<StopMessage> for CoordinatorStub {
     }
 }
 
-/// Devices that are never logged in to; no test talks to a device.
-pub fn devices() -> Devices {
-    Devices::new(Tapo {
-        username: "".to_string(),
-        password: "".to_string(),
-        refresh_rate_s: 60,
-    })
+impl Handler<GetDeviceSessionMessage> for CoordinatorStub {
+    type Result = Option<Addr<DeviceSessionActor>>;
+
+    /// No test talks to a device.
+    fn handle(&mut self, _: GetDeviceSessionMessage, _: &mut Context<Self>) -> Self::Result {
+        None
+    }
+}
+
+/// Device sessions that `coordinator_addr` hands out.
+pub fn device_sessions(coordinator_addr: &Addr<CoordinatorStub>) -> DeviceSessions {
+    DeviceSessions::new(coordinator_addr.clone().recipient())
 }
 
 pub struct TestApp {
     pub address: String,
-    pub coordinator: Addr<CoordinatorStub>,
+    pub coordinator_addr: Addr<CoordinatorStub>,
 }
 
 impl TestApp {
@@ -54,18 +60,23 @@ impl TestApp {
     }
 
     pub async fn with_coordinator(coordinator: CoordinatorStub) -> Self {
-        let coordinator = coordinator.start();
+        let coordinator_addr = coordinator.start();
 
-        let web_server = WebServer::new("localhost", 0, devices(), coordinator.clone().recipient())
-            .await
-            .expect("Failed to build API");
+        let web_server = WebServer::new(
+            "localhost",
+            0,
+            device_sessions(&coordinator_addr),
+            coordinator_addr.clone().recipient(),
+        )
+        .await
+        .expect("Failed to build API");
 
         let port = web_server.port();
         tokio::spawn(web_server.run_until_stopped());
 
         Self {
             address: format!("http://localhost:{port}"),
-            coordinator,
+            coordinator_addr,
         }
     }
 }

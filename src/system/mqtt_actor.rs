@@ -204,8 +204,8 @@ impl Handler<DeviceUsageMessage> for MqttActor {
         );
         let _enter = span.enter();
 
-        // Publishing it would hold up the stop. The coordinator stops the device actors first,
-        // so none should arrive this late.
+        // Publishing it would hold up the stop. The coordinator stops the device usage actors
+        // first, so none should arrive this late.
         if self.stop_requested {
             warn!("Stopping, dropping the device usage");
             return;

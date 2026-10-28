@@ -8,7 +8,8 @@ use home_automation_tapo::telemetry::{init_telemetry, shutdown_telemetry};
 
 // Together these stay well within Kubernetes' default 30s termination grace period. The actors
 // only have to drain what is in flight: an MQTT publish or the API's graceful stop, a few seconds
-// each.
+// each, and the request each device session is running. That one can take longer when a device
+// is unreachable; the timeout then cuts it off, and its spans may be lost.
 const ACTORS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const TELEMETRY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -24,7 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting home automation tapo system with Actix-RT on Tokio runtime");
 
     // Start coordinator actor
-    let coordinator =
+    let coordinator_addr =
         CoordinatorActor::spawn(settings).expect("Failed to start the CoordinatorActor");
 
     info!("System started, waiting for shutdown signal...");
@@ -34,9 +35,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Received shutdown signal, shutting down application...");
 
     // Stop the actors first so that no spans are created while telemetry is being flushed.
-    if tokio::time::timeout(ACTORS_SHUTDOWN_TIMEOUT, CoordinatorActor::stop(coordinator))
-        .await
-        .is_err()
+    if tokio::time::timeout(
+        ACTORS_SHUTDOWN_TIMEOUT,
+        CoordinatorActor::stop(coordinator_addr),
+    )
+    .await
+    .is_err()
     {
         warn!("Timed out waiting for the actors to stop");
     }

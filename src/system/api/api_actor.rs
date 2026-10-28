@@ -9,26 +9,30 @@ use tracing::{Instrument, debug, instrument};
 
 use crate::settings::Api;
 use crate::system::api::web_server::WebServer;
-use crate::system::devices::Devices;
+use crate::system::devices::DeviceSessions;
 use crate::system::messages::{ProbeMessage, StopMessage};
 use crate::telemetry::record_error;
 
 #[derive(Debug)]
 pub struct ApiActor {
     config_api: Api,
-    devices: Devices,
+    device_sessions: DeviceSessions,
     /// Probed by the health check.
-    coordinator: Recipient<ProbeMessage>,
+    probe_recipient: Recipient<ProbeMessage>,
     server_handle: Option<ServerHandle>,
 }
 
 impl ApiActor {
     #[instrument(name = "ApiActor::new", skip_all)]
-    pub fn new(config_api: Api, devices: Devices, coordinator: Recipient<ProbeMessage>) -> Self {
+    pub fn new(
+        config_api: Api,
+        device_sessions: DeviceSessions,
+        probe_recipient: Recipient<ProbeMessage>,
+    ) -> Self {
         Self {
             config_api,
-            devices,
-            coordinator,
+            device_sessions,
+            probe_recipient,
             server_handle: None,
         }
     }
@@ -71,14 +75,14 @@ impl Actor for ApiActor {
         let host = self.config_api.host.clone();
         let port = self.config_api.port;
 
-        let devices = self.devices.clone();
-        let coordinator = self.coordinator.clone();
+        let device_sessions = self.device_sessions.clone();
+        let probe_recipient = self.probe_recipient.clone();
 
         // Only block the mailbox while the server is being created; it then runs in the
         // background so that StopMessage can still be handled. A server that can't be created
         // stops the actor, and the coordinator retries on its next health check.
         let fut = async move {
-            WebServer::new(&host, port, devices, coordinator)
+            WebServer::new(&host, port, device_sessions, probe_recipient)
                 .await
                 .inspect_err(|e| record_error!(e))
                 .ok()

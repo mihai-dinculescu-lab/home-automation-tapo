@@ -3,21 +3,22 @@ use std::time::Duration;
 use actix::{
     Actor, ActorContext, ActorFutureExt, AsyncContext, Context, Handler, Recipient, WrapFuture,
 };
-use futures_util::FutureExt as _;
 use tracing::{Instrument, info_span, instrument, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::{
     settings::Device,
-    system::devices::{DeviceType, Devices},
+    system::devices::{DeviceSessions, DeviceType, Error as DeviceError},
     system::messages::{DeviceUsageMessage, StopMessage},
     telemetry::record_error,
 };
 
 #[derive(Debug)]
-pub struct DeviceActor {
+pub struct DeviceUsageActor {
     usage_recipient: Recipient<DeviceUsageMessage>,
-    devices: Devices,
+    device_sessions: DeviceSessions,
+    /// How often the device's usage is polled.
+    refresh_rate: Duration,
     device: Device,
     /// Set while a usage poll is running. A tick that lands meanwhile is skipped rather than
     /// queued behind it, so that a plug that answers slowly gets one poll at a time instead of
@@ -25,19 +26,21 @@ pub struct DeviceActor {
     polling: bool,
 }
 
-impl DeviceActor {
-    #[instrument(name = "DeviceActor::new", skip_all, fields(
+impl DeviceUsageActor {
+    #[instrument(name = "DeviceUsageActor::new", skip_all, fields(
         device.name = %device.name,
         device.ip_address = %device.ip_address,
     ))]
     pub fn new(
         usage_recipient: Recipient<DeviceUsageMessage>,
-        devices: Devices,
+        device_sessions: DeviceSessions,
+        refresh_rate: Duration,
         device: Device,
     ) -> Self {
         Self {
             usage_recipient,
-            devices,
+            device_sessions,
+            refresh_rate,
             device,
             polling: false,
         }
@@ -46,7 +49,7 @@ impl DeviceActor {
     /// Polls the device's usage, unless the previous poll is still running.
     fn tick(&mut self, ctx: &mut Context<Self>) {
         let span = info_span!(
-            "DeviceActor::tick",
+            "DeviceUsageActor::tick",
             device.name = %self.device.name,
             device.ip_address = %self.device.ip_address,
         );
@@ -60,10 +63,10 @@ impl DeviceActor {
         self.polling = true;
 
         let device = self.device.clone();
-        let devices = self.devices.clone();
+        let device_sessions = self.device_sessions.clone();
         let usage_recipient = self.usage_recipient.clone();
 
-        let fut = Self::query_device_usage(device, devices, usage_recipient)
+        let fut = Self::query_device_usage(device, device_sessions, usage_recipient)
             .instrument(span.clone())
             .into_actor(self)
             .map(|_, act, _| act.polling = false);
@@ -71,23 +74,19 @@ impl DeviceActor {
         ctx.spawn(fut);
     }
 
-    #[instrument(name = "DeviceActor::query_device_usage", skip_all, fields(
+    #[instrument(name = "DeviceUsageActor::query_device_usage", skip_all, fields(
         device.name = %device.name,
         device.ip_address = %device.ip_address,
     ))]
     async fn query_device_usage(
         device: Device,
-        devices: Devices,
+        device_sessions: DeviceSessions,
         usage_recipient: Recipient<DeviceUsageMessage>,
     ) {
         let span = tracing::Span::current();
 
-        let result = devices
-            .run(
-                DeviceType::PlugEnergyMonitoring,
-                &device.ip_address,
-                |handler| handler.device_usage().boxed_local(),
-            )
+        let result = device_sessions
+            .device_usage(DeviceType::PlugEnergyMonitoring, &device.ip_address)
             .await;
 
         match result {
@@ -102,20 +101,22 @@ impl DeviceActor {
                     record_error!(&e);
                 }
             }
+            // A poll that lands while the service stops.
+            Err(DeviceError::ShuttingDown) => warn!("Shutting down, the usage was not polled"),
             Err(e) => record_error!(&e),
         }
     }
 }
 
-impl Actor for DeviceActor {
+impl Actor for DeviceUsageActor {
     type Context = Context<Self>;
 
-    #[instrument(name = "DeviceActor::started", skip_all, fields(
+    #[instrument(name = "DeviceUsageActor::started", skip_all, fields(
         device.name = %self.device.name,
         device.ip_address = %self.device.ip_address,
     ))]
     fn started(&mut self, ctx: &mut Self::Context) {
-        let refresh_rate = Duration::from_secs(self.devices.config().refresh_rate_s);
+        let refresh_rate = self.refresh_rate;
 
         // `run_interval` waits a full interval before its first tick, so the first poll is
         // scheduled at once. It runs after `started` returns, so that its trace is its own rather
@@ -123,14 +124,14 @@ impl Actor for DeviceActor {
         ctx.run_later(Duration::ZERO, |act, ctx| act.tick(ctx));
         ctx.run_interval(refresh_rate, |act, ctx| act.tick(ctx));
     }
-    #[instrument(name = "DeviceActor::stopped", level = "error", skip_all, fields(
+    #[instrument(name = "DeviceUsageActor::stopped", level = "error", skip_all, fields(
         device.name = %self.device.name,
         device.ip_address = %self.device.ip_address,
     ))]
     fn stopped(&mut self, _: &mut Self::Context) {}
 }
 
-impl Handler<StopMessage> for DeviceActor {
+impl Handler<StopMessage> for DeviceUsageActor {
     type Result = ();
 
     fn handle(&mut self, _: StopMessage, ctx: &mut Context<Self>) -> Self::Result {

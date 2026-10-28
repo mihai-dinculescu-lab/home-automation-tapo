@@ -5,14 +5,13 @@ use actix::{
     WrapFuture,
 };
 use chrono::{DateTime, Utc};
-use futures_util::FutureExt as _;
 use futures_util::future::join_all;
 use tracing::{Instrument, debug, info, info_span, instrument, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::{
-    settings::{Heater, Thermostat},
-    system::devices::{DeviceType, Devices},
+    settings::{Heater, Tapo, Thermostat},
+    system::devices::{DeviceSessions, DeviceType, Error as DeviceError},
     system::messages::{GetSensorReadingMessage, SensorReading, StopMessage},
     system::thermostat::decision::{
         Decision, HeaterCommand, Presence, PresenceError, Reason, decide, person_present,
@@ -23,12 +22,15 @@ use crate::{
 #[derive(Debug)]
 pub struct ThermostatActor {
     reading_recipient: Recipient<GetSensorReadingMessage>,
-    devices: Devices,
+    device_sessions: DeviceSessions,
+    /// The credentials the camera is queried with; it has no session to share, so it is not
+    /// reached through `device_sessions`.
+    tapo: Tapo,
     config: Thermostat,
     /// The tick's work in flight, if any: the evaluation and the switch that follows it. The
-    /// next tick cancels it, so that a slow one can
-    /// neither hold the thermostat for several intervals nor finish after a newer one and switch
-    /// the heaters on older inputs.
+    /// next tick cancels it, so that a slow one cannot hold the thermostat for several intervals.
+    /// A switch already sent to a heater's session still completes, but the next tick's command
+    /// queues behind it, so the newest command still lands last.
     in_flight: Option<SpawnHandle>,
     /// The command of the last evaluation that completed, which the deadband repeats. `None`
     /// before the first one, so that a start inside the deadband turns the heaters off.
@@ -41,12 +43,14 @@ impl ThermostatActor {
     ))]
     pub fn new(
         reading_recipient: Recipient<GetSensorReadingMessage>,
-        devices: Devices,
+        device_sessions: DeviceSessions,
+        tapo: Tapo,
         config: Thermostat,
     ) -> Self {
         Self {
             reading_recipient,
-            devices,
+            device_sessions,
+            tapo,
             config,
             in_flight: None,
             last_command: None,
@@ -71,7 +75,7 @@ impl ThermostatActor {
         // on the first poll, so each is instrumented with the tick's span to be traced under it.
         let fut = Self::evaluate(
             self.reading_recipient.clone(),
-            self.devices.clone(),
+            self.tapo.clone(),
             self.config.clone(),
             self.last_command,
         )
@@ -82,7 +86,7 @@ impl ThermostatActor {
             act.last_command = Some(decision.command);
 
             Self::switch_heaters(
-                act.devices.clone(),
+                act.device_sessions.clone(),
                 act.config.heaters.clone(),
                 decision.command == HeaterCommand::On,
             )
@@ -94,8 +98,8 @@ impl ThermostatActor {
         self.in_flight = Some(ctx.spawn(fut));
     }
 
-    /// Cancels the tick's work in flight, if any. A cancelled tick leaves the heaters as they
-    /// are, so the caller asserts them anew.
+    /// Cancels the tick's work in flight, if any. A switch the cancelled tick already sent still
+    /// completes, one it had not sent yet does not, so the caller asserts the heaters anew.
     fn cancel_in_flight(&mut self, ctx: &mut Context<Self>) {
         if let Some(in_flight) = self.in_flight.take() {
             warn!("The previous tick's work is still running, cancelling it");
@@ -145,7 +149,7 @@ impl ThermostatActor {
     ))]
     async fn evaluate(
         reading_recipient: Recipient<GetSensorReadingMessage>,
-        devices: Devices,
+        tapo: Tapo,
         config: Thermostat,
         last_command: Option<HeaterCommand>,
     ) -> Decision {
@@ -166,7 +170,7 @@ impl ThermostatActor {
         let (reading, presence) =
             tokio::join!(Self::query_reading(&reading_recipient, &config), async {
                 if period.require_presence {
-                    Some(Self::query_presence(&devices, &config, now).await)
+                    Some(Self::query_presence(&tapo, &config, now).await)
                 } else {
                     None
                 }
@@ -200,11 +204,11 @@ impl ThermostatActor {
     #[instrument(name = "ThermostatActor::switch_heaters", skip_all, fields(
         heater.on = on,
     ))]
-    async fn switch_heaters(devices: Devices, heaters: Vec<Heater>, on: bool) {
+    async fn switch_heaters(device_sessions: DeviceSessions, heaters: Vec<Heater>, on: bool) {
         join_all(
             heaters
                 .iter()
-                .map(|heater| Self::switch_heater(&devices, heater, on)),
+                .map(|heater| Self::switch_heater(&device_sessions, heater, on)),
         )
         .await;
     }
@@ -235,21 +239,13 @@ impl ThermostatActor {
     #[instrument(name = "ThermostatActor::query_presence", skip_all, fields(
         camera.ip_address = %config.camera_ip_address,
     ))]
-    async fn query_presence(
-        devices: &Devices,
-        config: &Thermostat,
-        now: DateTime<Utc>,
-    ) -> Presence {
+    async fn query_presence(tapo: &Tapo, config: &Thermostat, now: DateTime<Utc>) -> Presence {
         let window_start = now - chrono::Duration::seconds(config.presence_window_s as i64);
 
         // The camera is only ever queried here, and a tick cancels the previous one, so it has
         // no session to share.
         let result = async {
-            let handler = devices
-                .config()
-                .client()
-                .c120(config.camera_ip_address.clone())
-                .await?;
+            let handler = tapo.client().c120(config.camera_ip_address.clone()).await?;
 
             handler.get_detections(window_start, now).await
         }
@@ -276,20 +272,18 @@ impl ThermostatActor {
         heater.ip_address = %heater.ip_address,
         heater.on = on,
     ))]
-    async fn switch_heater(devices: &Devices, heater: &Heater, on: bool) {
-        let result = devices
-            .run(
-                DeviceType::PlugEnergyMonitoring,
-                &heater.ip_address,
-                |handler| {
-                    if on {
-                        handler.on().boxed_local()
-                    } else {
-                        handler.off().boxed_local()
-                    }
-                },
-            )
-            .await;
+    async fn switch_heater(device_sessions: &DeviceSessions, heater: &Heater, on: bool) {
+        let device_type = DeviceType::PlugEnergyMonitoring;
+
+        let result = if on {
+            device_sessions
+                .turn_on(device_type, &heater.ip_address)
+                .await
+        } else {
+            device_sessions
+                .turn_off(device_type, &heater.ip_address)
+                .await
+        };
 
         match result {
             Ok(()) => info!(
@@ -297,6 +291,10 @@ impl ThermostatActor {
                 heater.name,
                 if on { "on" } else { "off" }
             ),
+            // A tick that lands while the service stops; the next start asserts the heaters.
+            Err(DeviceError::ShuttingDown) => {
+                warn!("Shutting down, heater '{}' was not switched", heater.name)
+            }
             Err(e) => record_error!(&e),
         }
     }
