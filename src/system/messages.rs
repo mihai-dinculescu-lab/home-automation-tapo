@@ -18,7 +18,7 @@ pub struct StopMessage;
 #[rtype(result = "()")]
 pub struct ProbeMessage;
 
-/// The latest reading received from a sensor over MQTT.
+/// A reading received from a sensor over MQTT.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SensorReading {
     pub location: String,
@@ -34,11 +34,14 @@ impl SensorReading {
     }
 }
 
+/// Sent by the sensors actor for every reading it receives, and forwarded by the coordinator to
+/// the thermostats whose `sensor_location` is the reading's, each of which keeps it and ticks on
+/// it.
 #[derive(Debug, Message)]
-#[rtype(result = "Option<SensorReading>")]
-pub struct GetSensorReadingMessage {
+#[rtype(result = "()")]
+pub struct SensorReadingMessage {
     pub span_context: opentelemetry::Context,
-    pub location: String,
+    pub reading: SensorReading,
 }
 
 /// Asks the coordinator for the session actor of the device at `ip_address`, which it creates

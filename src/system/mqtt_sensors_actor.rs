@@ -1,9 +1,9 @@
-use std::collections::HashMap;
 use std::pin::Pin;
 use std::time::Duration;
 
 use actix::{
-    Actor, ActorContext, ActorFutureExt, AsyncContext, Context, Handler, StreamHandler, WrapFuture,
+    Actor, ActorContext, ActorFutureExt, AsyncContext, Context, Handler, Recipient, StreamHandler,
+    WrapFuture,
 };
 use chrono::Utc;
 use paho_mqtt::{
@@ -12,10 +12,11 @@ use paho_mqtt::{
 };
 use serde::Deserialize;
 use tracing::{Instrument, info, instrument, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::{
-    system::messages::{GetSensorReadingMessage, SensorReading, StopMessage},
-    telemetry::{consumer_span, record_error},
+    system::messages::{SensorReading, SensorReadingMessage, StopMessage},
+    telemetry::record_error,
 };
 
 /// Paho's bound on a connect attempt.
@@ -45,24 +46,29 @@ struct SensorPayload {
 #[rtype(result = "()")]
 struct ConnectedMessage;
 
-/// Subscribes to the sensor readings published over MQTT and keeps the latest one per location.
+/// Subscribes to the sensor readings published over MQTT and sends each one on to the
+/// thermostats, which keep them.
 ///
 /// Separate from `MqttActor`, which publishes with its own client, so that a publish failure
-/// cannot take the readings cache down with it and the two never fight over one connection.
+/// cannot take the readings down with it and the two never fight over one connection.
 pub struct MqttSensorsActor {
     client: AsyncClient,
     topic_name: String,
+    /// Sent every reading, for the thermostats reading its location.
+    reading_recipient: Recipient<SensorReadingMessage>,
     /// Taken by `started`, which attaches it to the actor. Pinned because the receiver is not
     /// `Unpin` and actors have to be.
     stream: Option<Pin<Box<AsyncReceiver<Option<Message>>>>>,
-    /// Latest reading per `location`.
-    readings: HashMap<String, SensorReading>,
     stop_requested: bool,
 }
 
 impl MqttSensorsActor {
     #[instrument(name = "MqttSensorsActor::new", skip_all)]
-    pub fn new(address: String, topic_name: String) -> Result<Self, paho_mqtt::Error> {
+    pub fn new(
+        address: String,
+        topic_name: String,
+        reading_recipient: Recipient<SensorReadingMessage>,
+    ) -> Result<Self, paho_mqtt::Error> {
         // No client id, so the broker assigns one: two instances (a rolling update, a local run
         // against the same broker) would otherwise keep evicting each other's session.
         let create_options = CreateOptionsBuilder::new_v3()
@@ -77,8 +83,8 @@ impl MqttSensorsActor {
         Ok(Self {
             client,
             topic_name,
+            reading_recipient,
             stream: Some(Box::pin(stream)),
-            readings: HashMap::new(),
             stop_requested: false,
         })
     }
@@ -116,8 +122,7 @@ impl MqttSensorsActor {
     }
 
     /// Subscribes to the sensor readings, retrying a refusal (a broker still loading its ACLs
-    /// after a restart, a bad topic filter) until it succeeds or the actor is asked to stop. The
-    /// readings cache is kept meanwhile.
+    /// after a restart, a bad topic filter) until it succeeds or the actor is asked to stop.
     #[instrument(name = "MqttSensorsActor::subscribe", skip_all, fields(
         messaging.system = "mqtt",
         messaging.destination.name = %self.topic_name,
@@ -178,7 +183,7 @@ impl MqttSensorsActor {
         ctx.wait(fut);
     }
 
-    fn store_reading(&mut self, message: &Message) {
+    fn forward_reading(&self, message: &Message) {
         let span = tracing::Span::current();
 
         let payload = message.payload_str();
@@ -202,14 +207,18 @@ impl MqttSensorsActor {
             payload.location, payload.temperature
         );
 
-        self.readings.insert(
-            payload.location.clone(),
-            SensorReading {
+        let result = self.reading_recipient.try_send(SensorReadingMessage {
+            span_context: span.context(),
+            reading: SensorReading {
                 location: payload.location,
                 temperature: payload.temperature,
                 received_at: Utc::now(),
             },
-        );
+        });
+
+        if let Err(e) = result {
+            record_error!(&e);
+        }
     }
 }
 
@@ -254,7 +263,7 @@ impl StreamHandler<Option<Message>> for MqttSensorsActor {
         );
         let _enter = span.enter();
 
-        self.store_reading(&message);
+        self.forward_reading(&message);
     }
 
     // No `finished`: the stream's sender lives in the client's message callback and the client is
@@ -275,22 +284,5 @@ impl Handler<StopMessage> for MqttSensorsActor {
 
     fn handle(&mut self, _: StopMessage, ctx: &mut Context<Self>) -> Self::Result {
         self.stop(ctx);
-    }
-}
-
-impl Handler<GetSensorReadingMessage> for MqttSensorsActor {
-    type Result = Option<SensorReading>;
-
-    fn handle(&mut self, message: GetSensorReadingMessage, _: &mut Context<Self>) -> Self::Result {
-        let span = consumer_span!(
-            name = "MqttSensorsActor::Handler<GetSensorReadingMessage>",
-            message = GetSensorReadingMessage,
-            parent = message.span_context,
-            destination = "MqttSensorsActor",
-            sensor.location = %message.location,
-        );
-        let _enter = span.enter();
-
-        self.readings.get(&message.location).cloned()
     }
 }

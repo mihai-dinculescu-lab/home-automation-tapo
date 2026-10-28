@@ -64,9 +64,8 @@ pub struct Evaluation {
 }
 
 impl Evaluation {
-    /// How old the reading was at `decided_at`, in seconds; `None` without one. The reading is
-    /// fetched after `decided_at` is taken, so one received in between counts as 0 rather than
-    /// a negative age.
+    /// How old the reading was at `decided_at`, in seconds; `None` without one. A wall clock
+    /// stepped back since the reading was received counts as 0 rather than a negative age.
     pub fn reading_age_s(&self) -> Option<i64> {
         self.reading
             .as_ref()
@@ -182,6 +181,7 @@ mod tests {
             presence_window_s: 900,
             reading_max_age_s: 900,
             interval_s: 300,
+            min_interval_s: 60,
         }
     }
 
@@ -513,7 +513,7 @@ mod tests {
         };
 
         assert_eq!(evaluation(Duration::seconds(42)).reading_age_s(), Some(42));
-        // Received while the inputs were fetched, after `decided_at` was taken.
+        // The wall clock was stepped back since the reading was received.
         assert_eq!(evaluation(Duration::seconds(-1)).reading_age_s(), Some(0));
     }
 }

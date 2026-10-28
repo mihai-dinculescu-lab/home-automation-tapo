@@ -67,5 +67,9 @@ heating:
       presence_window_s:
       # a reading older than this many seconds is treated as missing, at most 86400 (24 hours)
       reading_max_age_s:
-      # how often the thermostat is evaluated, in seconds
+      # the longest time between two evaluations, in seconds, the one used when no sensor reading arrives
       interval_s:
+      # the shortest time between two evaluations, in seconds: every sensor reading is evaluated
+      # as it arrives, or once this has passed since the last evaluation; at least 60 and less than
+      # interval_s
+      min_interval_s:

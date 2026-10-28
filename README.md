@@ -13,7 +13,7 @@ Actor System consisting of:
 - Device Usage Actor - reads the device usage and sends it to the Coordinator Actor, which forwards it to the MQTT Actor (only when `device_usage` is enabled)
 - Device Session Actor - one per device, runs every request to it on a single session, one at a time
 - MQTT Actor - publishes the device usage and the thermostat decisions to the MQTT broker (only when `device_usage` or `heating` is enabled)
-- MQTT Sensors Actor - subscribes to the sensor readings on the MQTT broker and keeps the latest one per location (only when `heating` and at least one of its thermostats are enabled)
+- MQTT Sensors Actor - subscribes to the sensor readings on the MQTT broker and sends each one to the Coordinator Actor, which forwards it to the thermostats of its location (only when `heating` and at least one of its thermostats are enabled)
 - Thermostat Actor - decides whether a room should be heated, switches the heater plugs and sends the decision to the Coordinator Actor, which forwards it to the MQTT Actor (only when `heating` and the thermostat are enabled)
 - API Actor - REST API for turning devices on/off and getting their status
 
@@ -68,20 +68,29 @@ by requests with the same `device_type`, so a device that the service also polls
 ## Sensors
 
 While `heating` and at least one of its thermostats are enabled, the service subscribes to the MQTT topic filter
-`heating.sensors_subscribe_topic` (e.g. `sensors/#`) and keeps the latest reading per `location` from JSON payloads
-with at least `{"location": "Living Room", "temperature": 21.4}`. The messages are not retained, so readings are only
-known from the moment the service subscribes.
+`heating.sensors_subscribe_topic` (e.g. `sensors/#`) and sends every reading, from JSON payloads with at least
+`{"location": "Living Room", "temperature": 21.4}`, to the thermostats whose `sensor_location` is its `location`, each
+of which keeps the latest one. The messages are not retained, so readings are only known from the moment the service
+subscribes, and a thermostat that is restarted has none until the next one arrives.
 
 ## Thermostat
 
-Each enabled entry in `heating.thermostats` is evaluated every `interval_s` seconds under the rule of the active period
-containing the current time. The heaters are turned **on** when a person was detected by the camera in the last
-`presence_window_s` seconds and the latest sensor reading for `sensor_location` is under the period's
-`target_temperature - deadband`. They are turned **off** when nobody was detected, the camera cannot be queried,
-the reading is missing or older than `reading_max_age_s` seconds, or the temperature is above
-`target_temperature + deadband`. In between, the last command is repeated, so that they do not cycle around the
-setpoint; right after a start there is no last command and they are turned off. A period with
-`require_presence: false` skips the camera and heats the room on the reading alone, e.g. before anyone is up.
+Each enabled entry in `heating.thermostats` is evaluated on every reading for its `sensor_location`, and every
+`interval_s` seconds while none arrives, under the rule of the active period containing the current time. The heaters
+are turned **on** when a person was detected by the camera in the last `presence_window_s` seconds and the latest
+sensor reading for `sensor_location` is under the period's `target_temperature - deadband`. They are turned **off**
+when nobody was detected, the camera cannot be queried, the reading is missing or older than `reading_max_age_s`
+seconds, or the temperature is above `target_temperature + deadband`. In between, the last command is repeated, so
+that they do not cycle around the setpoint; right after a start there is no last command and they are turned off. A
+period with `require_presence: false` skips the camera and heats the room on the reading alone, e.g. before anyone
+is up.
+
+The ticks follow the sensor rather than a clock of their own: every reading starts a tick, so it is evaluated as it
+arrives, and every tick schedules the next one `interval_s` on in case no reading comes first. A sensor that falls
+silent leaves the ticks to the interval, which switch the heaters off once its reading is older than
+`reading_max_age_s`. A reading that arrives within `min_interval_s` of the last tick is evaluated once that has
+passed, so that the tick is not repeated on nearly the same inputs and a slow plug is not cancelled mid-switch.
+`min_interval_s` has to be at least 60, about the longest a tick with a slow plug takes, and less than `interval_s`.
 
 Every tick commands the heaters, so a plug switched by hand is corrected within one interval. Nothing happens on
 shutdown: the next start asserts the heaters on its first tick.
@@ -89,7 +98,7 @@ shutdown: the next start asserts the heaters on its first tick.
 The readings are not retained, so none is known right after a start and the heaters are turned off until the first
 one arrives. This also covers plugs left on by a run that crashed.
 
-The readings are the ones kept by the [Sensors](#sensors) subscription, matched on `sensor_location`. Person
+The readings are the ones sent by the [Sensors](#sensors) subscription, matched on `sensor_location`. Person
 detection is read from the camera's SD card through `get_detections`, so it has to be enabled in the Tapo app, and
 `presence_window_s` is capped at 24 hours by the camera. It also has to be at least `interval_s`, otherwise a person
 detected between two ticks can go unnoticed.
@@ -147,10 +156,11 @@ go by rather than the time of arrival.
 The thermostat is held to the guarantees below. Each is a bound that can be checked, not a mechanism. Two are not
 fully met yet and are marked as such.
 
-1. **A tick every `interval_s`.** The tick loop never waits on the work it starts, and each tick cancels the previous
-   one if it is still running, so a slow camera or plug can neither block the next evaluation nor switch the heaters
-   on older inputs. Every request to a device times out after 10 seconds, so even a tick that has to log in to a
-   slow plug again ends within about a minute.
+1. **A tick at least every `interval_s`.** Every tick schedules the next one a full interval on before it queries
+   anything, and a reading only ever brings it forward. The tick loop never waits on the work it starts, and each
+   tick cancels the previous one if it is still running, so a slow camera or plug can neither block the next
+   evaluation nor switch the heaters on older inputs. Every request to a device times out after 10 seconds, so even a
+   tick that has to log in to a slow plug again ends within about a minute.
 2. **A stuck process is replaced within about a minute.** `/health-check` round-trips a probe to the coordinator actor
    on the thread every actor runs on, so a blocked thread or a stopped coordinator fails the Kubernetes liveness probe,
    which restarts the pod. A thermostat actor that has died is recreated by the coordinator within 60 seconds.

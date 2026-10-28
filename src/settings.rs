@@ -14,6 +14,11 @@ const MAX_PRESENCE_WINDOW_S: u64 = 24 * 60 * 60;
 /// decision well inside the range `chrono::Duration` accepts.
 const MAX_READING_MAX_AGE_S: u64 = 24 * 60 * 60;
 
+/// About the longest an evaluation with a slow plug takes. A reading evaluated sooner after the
+/// last evaluation would be likely to cancel its switch; one evaluated later still can, if the
+/// evaluation runs long.
+const MIN_MIN_INTERVAL_S: u64 = 60;
+
 /// Bound on each request to a device. The devices are on the local network, so a request that
 /// takes longer than this has failed; tapo's default of 30 seconds would let a single unreachable
 /// device hold up a thermostat tick or the shutdown for far longer than either can afford.
@@ -209,8 +214,11 @@ pub struct Thermostat {
     pub presence_window_s: u64,
     /// A reading older than this many seconds is treated as missing.
     pub reading_max_age_s: u64,
-    /// How often the thermostat is evaluated.
+    /// The longest time between two evaluations, the one used when no reading arrives.
     pub interval_s: u64,
+    /// The shortest time between two evaluations. Every reading is evaluated as it arrives, or
+    /// once this has passed since the last evaluation. At least 60 and less than `interval_s`.
+    pub min_interval_s: u64,
 }
 
 impl Thermostat {
@@ -301,8 +309,10 @@ impl Settings {
     /// reads from cannot run, an empty list of devices or thermostats is a disabled section
     /// spelled another way, a zero interval busy-loops its actor's ticks, a presence window
     /// shorter than the interval misses anyone detected early in it and an empty one never sees
-    /// anyone, a presence window over 24 hours is refused by the camera on every tick, a zero
-    /// reading age makes every reading stale and an oversized one overflows the age arithmetic, a
+    /// anyone, a presence window over 24 hours is refused by the camera on every tick, a minimum
+    /// interval under a minute makes a reading likely to cancel a switch still running and one of
+    /// a whole interval or more never evaluates a reading early, a zero reading age makes every
+    /// reading stale and an oversized one overflows the age arithmetic, a
     /// negative deadband inverts the rules, a non-finite temperature makes every comparison
     /// false, a duplicate key makes the coordinator skip an entry, a thermostat without a period
     /// would never heat, an active period that starts when it ends is either empty or the whole
@@ -386,9 +396,18 @@ impl Heating {
             let name = &thermostat.name;
 
             ensure!(names.insert(name), "Duplicate thermostat name '{name}'");
+            // The two bounds on `min_interval_s` keep `interval_s` over a minute too, so a zero
+            // interval needs no check of its own.
             ensure!(
-                thermostat.interval_s > 0,
-                "Thermostat '{name}': interval_s must be greater than 0"
+                thermostat.min_interval_s >= MIN_MIN_INTERVAL_S,
+                "Thermostat '{name}': min_interval_s must be at least {MIN_MIN_INTERVAL_S}, about \
+                 the longest an evaluation with a slow plug takes, so that a reading is unlikely \
+                 to cancel a switch still running"
+            );
+            ensure!(
+                thermostat.min_interval_s < thermostat.interval_s,
+                "Thermostat '{name}': min_interval_s must be less than interval_s, otherwise no \
+                 reading is evaluated before the interval runs out"
             );
             ensure!(
                 thermostat.presence_window_s >= thermostat.interval_s,
@@ -527,6 +546,7 @@ mod tests {
             presence_window_s: 900,
             reading_max_age_s: 900,
             interval_s: 300,
+            min_interval_s: 60,
         }
     }
 
@@ -653,6 +673,32 @@ mod tests {
         heating(&mut settings).thermostats[0].interval_s = 0;
 
         assert!(error(&settings).contains("interval_s"));
+    }
+
+    #[test]
+    fn min_interval_not_less_than_interval_is_rejected() {
+        for min_interval_s in [300, 301] {
+            let mut settings = settings();
+            heating(&mut settings).thermostats[0].min_interval_s = min_interval_s;
+
+            assert!(
+                error(&settings).contains("min_interval_s must be less than interval_s"),
+                "min_interval_s {min_interval_s}"
+            );
+        }
+    }
+
+    #[test]
+    fn min_interval_under_a_minute_is_rejected() {
+        for min_interval_s in [0, 59] {
+            let mut settings = settings();
+            heating(&mut settings).thermostats[0].min_interval_s = min_interval_s;
+
+            assert!(
+                error(&settings).contains("min_interval_s must be at least 60"),
+                "min_interval_s {min_interval_s}"
+            );
+        }
     }
 
     #[test]
@@ -1038,6 +1084,7 @@ heating:
       presence_window_s: 900
       reading_max_age_s: 900
       interval_s: 300
+      min_interval_s: 60
 "
         );
 
@@ -1079,6 +1126,7 @@ heating:
       presence_window_s: 900
       reading_max_age_s: 900
       interval_s: 300
+      min_interval_s: 60
 "
         );
 
@@ -1109,6 +1157,7 @@ heating:
       presence_window_s: 900
       reading_max_age_s: 900
       interval_s: 300
+      min_interval_s: 60
 "
         );
 
@@ -1145,6 +1194,7 @@ heating:
       presence_window_s: 900
       reading_max_age_s: 900
       interval_s: 300
+      min_interval_s: 60
 "
         );
 

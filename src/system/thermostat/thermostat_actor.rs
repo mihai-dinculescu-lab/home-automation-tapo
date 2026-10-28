@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use actix::{
     Actor, ActorContext, ActorFutureExt, AsyncContext, Context, Handler, Recipient, SpawnHandle,
@@ -13,18 +13,17 @@ use crate::{
     settings::{Heater, Tapo, Thermostat},
     system::devices::{DeviceSessions, DeviceType, Error as DeviceError},
     system::messages::{
-        GetSensorReadingMessage, SensorReading, StopMessage, ThermostatDecisionMessage,
+        SensorReading, SensorReadingMessage, StopMessage, ThermostatDecisionMessage,
     },
     system::thermostat::decision::{
         Decision, Evaluation, HeaterCommand, HeaterSwitch, Presence, PresenceError, Reason,
         SwitchOutcome, decide, person_present,
     },
-    telemetry::record_error,
+    telemetry::{consumer_span, record_error, set_parent_context},
 };
 
 #[derive(Debug)]
 pub struct ThermostatActor {
-    reading_recipient: Recipient<GetSensorReadingMessage>,
     decision_recipient: Recipient<ThermostatDecisionMessage>,
     /// The topic the decisions are published on.
     decisions_publish_topic: String,
@@ -33,11 +32,18 @@ pub struct ThermostatActor {
     /// reached through `device_sessions`.
     tapo: Tapo,
     config: Thermostat,
+    /// The latest reading for `sensor_location`. `None` until the first one arrives, since the
+    /// readings are not retained.
+    reading: Option<SensorReading>,
     /// The tick's work in flight, if any: the evaluation and the switch that follows it. The
     /// next tick cancels it, so that a slow one cannot hold the thermostat for several intervals.
     /// A switch already sent to a heater's session still completes, but the next tick's command
     /// queues behind it, so the newest command still lands last.
     in_flight: Option<SpawnHandle>,
+    /// When the last tick started, `None` before the first one.
+    last_tick: Option<Instant>,
+    /// The next tick and when it is due: an interval after the last one, or sooner for a reading.
+    next_tick: Option<(SpawnHandle, Instant)>,
     /// The command of the last evaluation that completed, which the deadband repeats. `None`
     /// before the first one, so that a start inside the deadband turns the heaters off.
     last_command: Option<HeaterCommand>,
@@ -48,7 +54,6 @@ impl ThermostatActor {
         thermostat.name = %config.name,
     ))]
     pub fn new(
-        reading_recipient: Recipient<GetSensorReadingMessage>,
         decision_recipient: Recipient<ThermostatDecisionMessage>,
         decisions_publish_topic: String,
         device_sessions: DeviceSessions,
@@ -56,28 +61,58 @@ impl ThermostatActor {
         config: Thermostat,
     ) -> Self {
         Self {
-            reading_recipient,
             decision_recipient,
             decisions_publish_topic,
             device_sessions,
             tapo,
             config,
+            reading: None,
             in_flight: None,
+            last_tick: None,
+            next_tick: None,
             last_command: None,
         }
     }
 
+    /// Schedules the next tick in `delay`, replacing the one scheduled before. A tick started by
+    /// a reading carries the reading's span context in `cause`, so that it is traced under it.
+    fn schedule_tick(
+        &mut self,
+        ctx: &mut Context<Self>,
+        delay: Duration,
+        cause: Option<opentelemetry::Context>,
+    ) {
+        if let Some((next_tick, _)) = self.next_tick.take() {
+            ctx.cancel_future(next_tick);
+        }
+
+        let handle = ctx.run_later(delay, |act, ctx| act.tick(ctx, cause));
+        self.next_tick = Some((handle, Instant::now() + delay));
+    }
+
     /// Evaluates and switches the heaters, cancelling whatever the previous tick left running.
-    fn tick(&mut self, ctx: &mut Context<Self>) {
+    ///
+    /// Runs on every reading for the thermostat's sensor, at least `min_interval_s` after the
+    /// last tick, and an interval after the last tick when no reading comes first, so that a
+    /// sensor that falls silent still gets the heaters asserted, and switched off once its
+    /// reading goes stale. A tick started by a reading is traced under it, through `cause`.
+    fn tick(&mut self, ctx: &mut Context<Self>, cause: Option<opentelemetry::Context>) {
         let span = info_span!(
             "ThermostatActor::tick",
             thermostat.name = %self.config.name,
         );
+        if let Some(cause) = cause {
+            set_parent_context(&span, cause);
+        }
         let _enter = span.enter();
 
         // Every tick asserts the heaters anew, so whatever the previous one left running is
         // cancelled before it can switch them on older inputs.
         self.cancel_in_flight(ctx);
+
+        // On the monotonic clock, so that a step of the wall clock cannot move the ticks.
+        self.last_tick = Some(Instant::now());
+        self.schedule_tick(ctx, Duration::from_secs(self.config.interval_s), None);
 
         let switch_span = span.clone();
         let publish_span = span.clone();
@@ -85,7 +120,7 @@ impl ThermostatActor {
         // Both futures are polled outside the tick's span, and their own spans are only created
         // on the first poll, so each is instrumented with the tick's span to be traced under it.
         let fut = Self::evaluate(
-            self.reading_recipient.clone(),
+            self.reading.clone(),
             self.tapo.clone(),
             self.config.clone(),
             self.last_command,
@@ -166,8 +201,8 @@ impl ThermostatActor {
     /// has remembered the command, so that a tick cancelled mid-switch still leaves the command
     /// it decided for the deadband to repeat.
     ///
-    /// Only what the period needs is queried: outside every period nothing is, and inside one
-    /// the camera is only consulted when the period requires presence.
+    /// Only what the period needs is used: outside every period nothing is, not even `reading`,
+    /// and inside one the camera is only consulted when the period requires presence.
     ///
     /// A camera failure is recorded on the camera's span but does not fail the tick: it is a
     /// normal `Off` decision.
@@ -182,7 +217,7 @@ impl ThermostatActor {
         thermostat.reason = tracing::field::Empty,
     ))]
     async fn evaluate(
-        reading_recipient: Recipient<GetSensorReadingMessage>,
+        reading: Option<SensorReading>,
         tapo: Tapo,
         config: Thermostat,
         last_command: Option<HeaterCommand>,
@@ -206,15 +241,11 @@ impl ThermostatActor {
         span.record("thermostat.target_temperature", period.target_temperature);
         span.record("thermostat.require_presence", period.require_presence);
 
-        // The two inputs are independent, so they are fetched together.
-        let (reading, presence) =
-            tokio::join!(Self::query_reading(&reading_recipient, &config), async {
-                if period.require_presence {
-                    Some(Self::query_presence(&tapo, &config, now).await)
-                } else {
-                    None
-                }
-            });
+        let presence = if period.require_presence {
+            Some(Self::query_presence(&tapo, &config, now).await)
+        } else {
+            None
+        };
 
         let decision = decide(now, presence, reading.as_ref(), last_command, &config);
 
@@ -265,29 +296,6 @@ impl ThermostatActor {
             }
         }))
         .await
-    }
-
-    #[instrument(name = "ThermostatActor::query_reading", skip_all, fields(
-        sensor.location = %config.sensor_location,
-    ))]
-    async fn query_reading(
-        reading_recipient: &Recipient<GetSensorReadingMessage>,
-        config: &Thermostat,
-    ) -> Option<SensorReading> {
-        let result = reading_recipient
-            .send(GetSensorReadingMessage {
-                span_context: tracing::Span::current().context(),
-                location: config.sensor_location.clone(),
-            })
-            .await;
-
-        match result {
-            Ok(reading) => reading,
-            Err(e) => {
-                record_error!(&e);
-                None
-            }
-        }
     }
 
     #[instrument(name = "ThermostatActor::query_presence", skip_all, fields(
@@ -379,12 +387,10 @@ impl Actor for ThermostatActor {
             );
         }
 
-        // `run_interval` waits a full interval before its first tick, so the first one is
-        // scheduled at once: a start asserts the heaters straight away. It runs after `started`
-        // returns, so that its trace is its own rather than part of this span.
-        let interval = Duration::from_secs(self.config.interval_s);
-        ctx.run_later(Duration::ZERO, |act, ctx| act.tick(ctx));
-        ctx.run_interval(interval, |act, ctx| act.tick(ctx));
+        // The first tick runs at once, so that a start asserts the heaters straight away, and
+        // schedules the next one. It runs after `started` returns, so that its trace is its own
+        // rather than part of this span.
+        self.schedule_tick(ctx, Duration::ZERO, None);
     }
 
     #[instrument(name = "ThermostatActor::stopped", level = "error", skip_all, fields(
@@ -393,11 +399,145 @@ impl Actor for ThermostatActor {
     fn stopped(&mut self, _: &mut Self::Context) {}
 }
 
+impl Handler<SensorReadingMessage> for ThermostatActor {
+    type Result = ();
+
+    /// Keeps the reading and ticks on it at once, so that it is evaluated fresh whenever the
+    /// sensor publishes, unless the last tick was less than `min_interval_s` ago: the tick then
+    /// runs once that has passed, so that it neither repeats the last one on nearly the same
+    /// inputs nor cancels a switch still running. The tick is traced under the latest reading it
+    /// evaluates.
+    fn handle(&mut self, message: SensorReadingMessage, ctx: &mut Context<Self>) -> Self::Result {
+        let span = consumer_span!(
+            name = "ThermostatActor::Handler<SensorReadingMessage>",
+            message = SensorReadingMessage,
+            parent = message.span_context,
+            destination = "ThermostatActor",
+            thermostat.name = %self.config.name,
+            sensor.location = %message.reading.location,
+            sensor.temperature = message.reading.temperature,
+        );
+        let _enter = span.enter();
+
+        self.reading = Some(message.reading);
+
+        let delay = reading_tick_delay(
+            Instant::now(),
+            self.last_tick,
+            self.next_tick.as_ref().map(|(_, next_due)| *next_due),
+            Duration::from_secs(self.config.min_interval_s),
+        );
+
+        if !delay.is_zero() {
+            debug!(
+                "Thermostat '{}': the last tick was too recent, evaluating the reading in {:.1} s",
+                self.config.name,
+                delay.as_secs_f64()
+            );
+        }
+
+        // The tick replaces the one scheduled before, so that a tick already due by then is
+        // traced under this reading, which it evaluates, rather than under the one it was
+        // scheduled for.
+        self.schedule_tick(ctx, delay, Some(span.context()));
+    }
+}
+
 impl Handler<StopMessage> for ThermostatActor {
     type Result = ();
 
     /// Stops without touching the heaters: the next start asserts them on its first tick.
     fn handle(&mut self, _: StopMessage, ctx: &mut Context<Self>) -> Self::Result {
         ctx.stop();
+    }
+}
+
+/// How long after `now` a reading's tick runs: once `min_interval` has passed since the last
+/// tick, at once if it already has, or when the next tick is due if that is sooner, such as one
+/// already waiting for an earlier reading.
+fn reading_tick_delay(
+    now: Instant,
+    last_tick: Option<Instant>,
+    next_tick: Option<Instant>,
+    min_interval: Duration,
+) -> Duration {
+    let after_min_interval = last_tick.map_or(Duration::ZERO, |last_tick| {
+        (last_tick + min_interval).saturating_duration_since(now)
+    });
+
+    next_tick.map_or(after_min_interval, |next_tick| {
+        next_tick
+            .saturating_duration_since(now)
+            .min(after_min_interval)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MIN_INTERVAL: Duration = Duration::from_secs(60);
+    const INTERVAL: Duration = Duration::from_secs(300);
+
+    fn secs(secs: u64) -> Duration {
+        Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn reading_before_any_tick_ticks_at_once() {
+        let now = Instant::now();
+
+        assert_eq!(
+            reading_tick_delay(now, None, None, MIN_INTERVAL),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn reading_min_interval_after_the_last_tick_ticks_at_once() {
+        let last_tick = Instant::now();
+
+        for since_last_tick in [MIN_INTERVAL, secs(200)] {
+            assert_eq!(
+                reading_tick_delay(
+                    last_tick + since_last_tick,
+                    Some(last_tick),
+                    Some(last_tick + INTERVAL),
+                    MIN_INTERVAL
+                ),
+                Duration::ZERO,
+                "{since_last_tick:?} after the last tick"
+            );
+        }
+    }
+
+    #[test]
+    fn reading_within_min_interval_waits_for_the_rest_of_it() {
+        let last_tick = Instant::now();
+
+        assert_eq!(
+            reading_tick_delay(
+                last_tick + secs(20),
+                Some(last_tick),
+                Some(last_tick + INTERVAL),
+                MIN_INTERVAL
+            ),
+            secs(40)
+        );
+    }
+
+    #[test]
+    fn reading_within_min_interval_runs_with_a_tick_due_sooner() {
+        let last_tick = Instant::now();
+
+        assert_eq!(
+            reading_tick_delay(
+                last_tick + secs(20),
+                Some(last_tick),
+                Some(last_tick + secs(50)),
+                MIN_INTERVAL
+            ),
+            secs(30)
+        );
     }
 }
