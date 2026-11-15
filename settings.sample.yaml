@@ -53,8 +53,14 @@ heating:
           # whether the heaters are only switched on while a person is present; `false` heats the
           # room regardless, e.g. before anyone is up
           require_presence:
-      # camera whose person detections decide presence
-      camera_ip_address:
+      # the device whose person detections decide presence
+      presence:
+        # the Tapo handler of the device: camera (C120) | camera_ptz (C210, C220, C225, C325WB,
+        # C520WS, TC40, TC70)
+        device_type:
+        ip_address:
+        # a person detected this many seconds ago still counts as present, at least interval_s and at most 86400 (24 hours)
+        window_s:
       # matches the `location` field of the sensor payload
       sensor_location:
       # P110 plugs switched together
@@ -63,8 +69,6 @@ heating:
           ip_address:
       # half-width of the band around the target in which the last command is repeated
       deadband:
-      # a person detected this many seconds ago still counts as present, at least interval_s and at most 86400 (24 hours)
-      presence_window_s:
       # a reading older than this many seconds is treated as missing, at most 86400 (24 hours)
       reading_max_age_s:
       # the longest time between two evaluations, in seconds, the one used when no sensor reading arrives

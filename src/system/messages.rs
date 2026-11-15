@@ -157,8 +157,8 @@ pub struct ThermostatDecisionPayload {
     reason: Reason,
     // The period the tick ran under, null outside every period
     active_period: Option<ActivePeriod>,
-    // Null when the camera was not queried or could not be
-    person_detected: Option<bool>,
+    // Null when the presence source was not queried or could not be
+    presence_detected: Option<bool>,
     // The latest reading in °C, null when there is none
     temperature: Option<f64>,
     // The age of the latest reading in seconds, null when there is none
@@ -177,7 +177,7 @@ impl ThermostatDecisionPayload {
             decided_at: evaluation.decided_at,
             command: evaluation.decision.command,
             reason: evaluation.decision.reason,
-            person_detected: evaluation.presence.and_then(Result::ok),
+            presence_detected: evaluation.presence.and_then(Result::ok),
             temperature: evaluation
                 .reading
                 .as_ref()
@@ -246,7 +246,7 @@ mod tests {
                     "target_temperature": 21.0,
                     "require_presence": true,
                 },
-                "person_detected": true,
+                "presence_detected": true,
                 "temperature": 20.1,
                 "reading_age_s": 42,
                 "heaters": [
@@ -258,18 +258,18 @@ mod tests {
     }
 
     #[test]
-    fn camera_error_is_published_as_unknown_presence() {
+    fn presence_error_is_published_as_unknown_presence() {
         let evaluation = Evaluation {
             decided_at: decided_at(),
             active_period: Some(ActivePeriod::new("07:00", "22:00", 21.0, true)),
             presence: Some(Err(PresenceError)),
             reading: None,
-            decision: Decision::new(HeaterCommand::Off, Reason::CameraError),
+            decision: Decision::new(HeaterCommand::Off, Reason::PresenceError),
         };
 
         let payload = payload(evaluation, vec![]);
 
-        assert_eq!(payload["person_detected"], json!(null));
+        assert_eq!(payload["presence_detected"], json!(null));
     }
 
     // The spellings consumers match on, as listed in the README. The matches have no wildcard, so
@@ -286,7 +286,7 @@ mod tests {
     fn reason_spelling(reason: Reason) -> &'static str {
         match reason {
             Reason::OutsideActivePeriod => "outside_active_period",
-            Reason::CameraError => "camera_error",
+            Reason::PresenceError => "presence_error",
             Reason::NobodyPresent => "nobody_present",
             Reason::NoReading => "no_reading",
             Reason::StaleReading => "stale_reading",
@@ -312,7 +312,7 @@ mod tests {
 
         for reason in [
             Reason::OutsideActivePeriod,
-            Reason::CameraError,
+            Reason::PresenceError,
             Reason::NobodyPresent,
             Reason::NoReading,
             Reason::StaleReading,

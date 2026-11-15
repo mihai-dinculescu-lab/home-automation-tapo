@@ -1,16 +1,15 @@
 use chrono::{DateTime, Duration, Utc};
 use derive_more::Display;
 use serde::Serialize;
-use tapo::responses::{DetectionResult, RecordingType};
 
 use crate::settings::{ActivePeriod, Thermostat};
 use crate::system::messages::SensorReading;
 
-/// The camera could not be queried, so presence is unknown.
+/// The presence source could not be queried, so presence is unknown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PresenceError;
 
-/// Whether a person is present, or `Err` when the camera could not be queried.
+/// Whether presence was detected, or `Err` when the presence source could not be queried.
 pub type Presence = Result<bool, PresenceError>;
 
 /// `Display` names it in the logs and on the spans, `Serialize` in the published decisions.
@@ -27,8 +26,8 @@ pub enum HeaterCommand {
 pub enum Reason {
     /// The tick fell outside every active period.
     OutsideActivePeriod,
-    /// The period requires presence and the camera could not be queried, or was not.
-    CameraError,
+    /// The period requires presence and the presence source could not be queried, or was not.
+    PresenceError,
     NobodyPresent,
     NoReading,
     StaleReading,
@@ -57,7 +56,7 @@ pub struct Evaluation {
     pub decided_at: DateTime<Utc>,
     /// The period the tick ran under; `None` outside every period.
     pub active_period: Option<ActivePeriod>,
-    /// `None` when the camera was not consulted.
+    /// `None` when the presence source was not consulted.
     pub presence: Option<Presence>,
     pub reading: Option<SensorReading>,
     pub decision: Decision,
@@ -89,20 +88,12 @@ pub struct HeaterSwitch {
     pub outcome: SwitchOutcome,
 }
 
-/// A person counts as present when any detection has `Person` among its events and ended at or
-/// after `window_start`.
-pub fn person_present(detections: &[DetectionResult], window_start: DateTime<Utc>) -> bool {
-    detections.iter().any(|detection| {
-        detection.end_time >= window_start && detection.events.contains(&RecordingType::Person)
-    })
-}
-
 /// Decides what to do with the heaters. The rules are evaluated in order; the first match wins.
 ///
 /// The rule a tick runs under is the active period containing `now`: it holds the target and
 /// says whether presence is consulted. Outside every period the heaters are turned off.
 ///
-/// `presence` is `None` when the camera was not consulted. A period that requires presence
+/// `presence` is `None` when the presence source was not consulted. A period that requires presence
 /// treats that as unknown, which decides off, so that the decision function rather than the
 /// actor encodes when presence matters. A period that does not require presence ignores it.
 ///
@@ -127,7 +118,7 @@ pub fn decide(
     if period.require_presence {
         match presence {
             None | Some(Err(PresenceError)) => {
-                return Decision::new(HeaterCommand::Off, Reason::CameraError);
+                return Decision::new(HeaterCommand::Off, Reason::PresenceError);
             }
             Some(Ok(false)) => return Decision::new(HeaterCommand::Off, Reason::NobodyPresent),
             Some(Ok(true)) => {}
@@ -161,7 +152,7 @@ mod tests {
     use chrono::TimeZone;
 
     use super::*;
-    use crate::settings::ActivePeriod;
+    use crate::settings::{ActivePeriod, PresenceSource};
 
     fn period(start: &str, end: &str, target_temperature: f64) -> ActivePeriod {
         ActivePeriod::new(start, end, target_temperature, true)
@@ -174,11 +165,13 @@ mod tests {
             enabled: true,
             time_zone: chrono_tz::Europe::London,
             active_periods: vec![period("08:00", "22:00", 22.0)],
-            camera_ip_address: "192.168.1.154".to_string(),
+            presence: PresenceSource::Camera {
+                ip_address: "192.168.1.154".to_string(),
+                window_s: 900,
+            },
             sensor_location: "Living Room".to_string(),
             heaters: vec![],
             deadband: 0.25,
-            presence_window_s: 900,
             reading_max_age_s: 900,
             interval_s: 300,
             min_interval_s: 60,
@@ -196,17 +189,6 @@ mod tests {
             temperature,
             received_at: now() - age,
         }
-    }
-
-    /// `DetectionResult` is not constructible outside `tapo`, so it is built from its serialized form.
-    fn detection(end_time: DateTime<Utc>, events: Vec<RecordingType>) -> DetectionResult {
-        serde_json::from_value(serde_json::json!({
-            "start_time": (end_time - Duration::seconds(10)).to_rfc3339(),
-            "end_time": end_time.to_rfc3339(),
-            "trigger": events.last().unwrap(),
-            "events": events,
-        }))
-        .unwrap()
     }
 
     #[test]
@@ -256,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn period_requiring_presence_treats_no_presence_as_a_camera_error() {
+    fn period_requiring_presence_treats_no_presence_as_a_presence_error() {
         let decision = decide(
             now(),
             None,
@@ -267,7 +249,7 @@ mod tests {
 
         assert_eq!(
             decision,
-            Decision::new(HeaterCommand::Off, Reason::CameraError)
+            Decision::new(HeaterCommand::Off, Reason::PresenceError)
         );
     }
 
@@ -302,7 +284,7 @@ mod tests {
     }
 
     #[test]
-    fn camera_error_turns_off() {
+    fn presence_error_turns_off() {
         let decision = decide(
             now(),
             Some(Err(PresenceError)),
@@ -313,7 +295,7 @@ mod tests {
 
         assert_eq!(
             decision,
-            Decision::new(HeaterCommand::Off, Reason::CameraError)
+            Decision::new(HeaterCommand::Off, Reason::PresenceError)
         );
     }
 
@@ -459,47 +441,6 @@ mod tests {
                 "temperature {temperature}"
             );
         }
-    }
-
-    #[test]
-    fn person_present_requires_a_person_event_in_the_window() {
-        let window_start = now() - Duration::seconds(900);
-
-        assert!(person_present(
-            &[detection(
-                now(),
-                vec![RecordingType::Motion, RecordingType::Person]
-            )],
-            window_start
-        ));
-        assert!(
-            !person_present(
-                &[detection(now(), vec![RecordingType::Motion])],
-                window_start
-            ),
-            "motion alone is not a person"
-        );
-        assert!(
-            !person_present(
-                &[detection(
-                    window_start - Duration::seconds(1),
-                    vec![RecordingType::Person]
-                )],
-                window_start
-            ),
-            "a detection that ended before the window does not count"
-        );
-        assert!(!person_present(&[], window_start));
-    }
-
-    #[test]
-    fn detection_ending_exactly_at_window_start_counts() {
-        let window_start = now() - Duration::seconds(900);
-
-        assert!(person_present(
-            &[detection(window_start, vec![RecordingType::Person])],
-            window_start
-        ));
     }
 
     #[test]

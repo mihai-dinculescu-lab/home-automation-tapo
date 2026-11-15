@@ -7,7 +7,8 @@ use chrono_tz::Tz;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tapo::ApiClient;
 
-/// The longest window the camera's detection search accepts.
+/// The longest window a camera's detection search accepts. Kept for every presence source, so
+/// that there is one rule rather than one per device.
 const MAX_PRESENCE_WINDOW_S: u64 = 24 * 60 * 60;
 
 /// A sensor silent for a day is broken, not slow. The bound also keeps the age arithmetic in the
@@ -186,9 +187,57 @@ fn serialize_time<S: Serializer>(time: &NaiveTime, serializer: S) -> Result<S::O
     serializer.collect_str(&time.format("%H:%M"))
 }
 
+/// The device a thermostat asks for presence. `device_type` names the Tapo handler it is reached
+/// through, not its model, as `DeviceType` does for the devices of the API. It is kept apart
+/// from `DeviceType`, which lists what is switched through a session; none of these are.
+///
+/// `window_s` is declared on each variant rather than on a struct with the enum flattened into
+/// it: serde's `flatten` disables `deny_unknown_fields`, which rejecting a file in the shape of
+/// an earlier release relies on.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "device_type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PresenceSource {
+    /// The `CameraHandler`: C120.
+    Camera {
+        ip_address: String,
+        /// A person detected this many seconds ago still counts as present. At least
+        /// `interval_s` and at most 24 hours.
+        window_s: u64,
+    },
+    /// The `CameraPtzHandler`: C210, C220, C225, C325WB, C520WS, TC40, TC70.
+    CameraPtz {
+        ip_address: String,
+        /// As on `Camera`.
+        window_s: u64,
+    },
+}
+
+impl PresenceSource {
+    /// As written in the settings, for the spans.
+    pub fn device_type(&self) -> &'static str {
+        match self {
+            Self::Camera { .. } => "camera",
+            Self::CameraPtz { .. } => "camera_ptz",
+        }
+    }
+
+    pub fn ip_address(&self) -> &str {
+        match self {
+            Self::Camera { ip_address, .. } | Self::CameraPtz { ip_address, .. } => ip_address,
+        }
+    }
+
+    /// Presence this many seconds ago still counts.
+    pub fn window_s(&self) -> u64 {
+        match self {
+            Self::Camera { window_s, .. } | Self::CameraPtz { window_s, .. } => *window_s,
+        }
+    }
+}
+
 /// Unknown keys are rejected so that a settings file in the shape of an earlier release, which
-/// kept `active_period` and `target_temperature` here, fails at startup instead of being read
-/// with those silently ignored.
+/// kept `active_period` and `target_temperature` here, and later `camera_ip_address` and
+/// `presence_window_s`, fails at startup instead of being read with those silently ignored.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Thermostat {
@@ -201,8 +250,8 @@ pub struct Thermostat {
     /// At least one. The periods may abut but not overlap, and a gap between two of them has to
     /// last at least `interval_s` or not exist at all.
     pub active_periods: Vec<ActivePeriod>,
-    /// Camera whose person detections decide presence.
-    pub camera_ip_address: String,
+    /// The device that decides presence. Required even when no period requires presence.
+    pub presence: PresenceSource,
     /// Matches the `location` field of the sensor payload.
     pub sensor_location: String,
     /// Plugs switched together. Optional; without any, the decision is only logged and published.
@@ -210,8 +259,6 @@ pub struct Thermostat {
     pub heaters: Vec<Heater>,
     /// Half-width of the band around the target in which the last command is repeated.
     pub deadband: f64,
-    /// A person detected this many seconds ago still counts as present. At most 24 hours.
-    pub presence_window_s: u64,
     /// A reading older than this many seconds is treated as missing.
     pub reading_max_age_s: u64,
     /// The longest time between two evaluations, the one used when no reading arrives.
@@ -309,7 +356,7 @@ impl Settings {
     /// reads from cannot run, an empty list of devices or thermostats is a disabled section
     /// spelled another way, a zero interval busy-loops its actor's ticks, a presence window
     /// shorter than the interval misses anyone detected early in it and an empty one never sees
-    /// anyone, a presence window over 24 hours is refused by the camera on every tick, a minimum
+    /// anyone, a presence window over 24 hours is refused by a camera on every tick, a minimum
     /// interval under a minute makes a reading likely to cancel a switch still running and one of
     /// a whole interval or more never evaluates a reading early, a zero reading age makes every
     /// reading stale and an oversized one overflows the age arithmetic, a
@@ -410,14 +457,14 @@ impl Heating {
                  reading is evaluated before the interval runs out"
             );
             ensure!(
-                thermostat.presence_window_s >= thermostat.interval_s,
-                "Thermostat '{name}': presence_window_s must be at least interval_s, otherwise a \
-                 person detected between two ticks can go unnoticed"
+                thermostat.presence.window_s() >= thermostat.interval_s,
+                "Thermostat '{name}': presence.window_s must be at least interval_s, otherwise \
+                 presence detected between two ticks can go unnoticed"
             );
             ensure!(
-                thermostat.presence_window_s <= MAX_PRESENCE_WINDOW_S,
-                "Thermostat '{name}': presence_window_s must be at most {MAX_PRESENCE_WINDOW_S} \
-                 (24 hours), the longest window the camera accepts"
+                thermostat.presence.window_s() <= MAX_PRESENCE_WINDOW_S,
+                "Thermostat '{name}': presence.window_s must be at most {MAX_PRESENCE_WINDOW_S} \
+                 (24 hours), the longest window a camera accepts, kept for every presence source"
             );
             ensure!(
                 thermostat.reading_max_age_s > 0,
@@ -539,14 +586,20 @@ mod tests {
             enabled: true,
             time_zone: chrono_tz::Europe::London,
             active_periods: vec![period("08:00", "22:00")],
-            camera_ip_address: "192.168.1.154".to_string(),
+            presence: camera(900),
             sensor_location: "Living Room".to_string(),
             heaters: vec![],
             deadband: 0.25,
-            presence_window_s: 900,
             reading_max_age_s: 900,
             interval_s: 300,
             min_interval_s: 60,
+        }
+    }
+
+    fn camera(window_s: u64) -> PresenceSource {
+        PresenceSource::Camera {
+            ip_address: "192.168.1.154".to_string(),
+            window_s,
         }
     }
 
@@ -703,13 +756,13 @@ mod tests {
 
     #[test]
     fn presence_window_shorter_than_interval_is_rejected() {
-        for presence_window_s in [0, 299] {
+        for window_s in [0, 299] {
             let mut settings = settings();
-            heating(&mut settings).thermostats[0].presence_window_s = presence_window_s;
+            heating(&mut settings).thermostats[0].presence = camera(window_s);
 
             assert!(
-                error(&settings).contains("presence_window_s must be at least interval_s"),
-                "presence_window_s {presence_window_s}"
+                error(&settings).contains("presence.window_s must be at least interval_s"),
+                "window_s {window_s}"
             );
         }
     }
@@ -717,7 +770,7 @@ mod tests {
     #[test]
     fn presence_window_equal_to_interval_passes() {
         let mut settings = settings();
-        heating(&mut settings).thermostats[0].presence_window_s = 300;
+        heating(&mut settings).thermostats[0].presence = camera(300);
 
         settings.validate().unwrap();
     }
@@ -725,9 +778,9 @@ mod tests {
     #[test]
     fn presence_window_over_a_day_is_rejected() {
         let mut settings = settings();
-        heating(&mut settings).thermostats[0].presence_window_s = MAX_PRESENCE_WINDOW_S + 1;
+        heating(&mut settings).thermostats[0].presence = camera(MAX_PRESENCE_WINDOW_S + 1);
 
-        assert!(error(&settings).contains("presence_window_s"));
+        assert!(error(&settings).contains("presence.window_s must be at most"));
     }
 
     #[test]
@@ -1078,10 +1131,12 @@ heating:
           end: \"22:00\"
           target_temperature: 22.0
           require_presence: true
-      camera_ip_address: 192.168.1.154
+      presence:
+        device_type: camera
+        ip_address: 192.168.1.154
+        window_s: 900
       sensor_location: Living Room
       deadband: 0.25
-      presence_window_s: 900
       reading_max_age_s: 900
       interval_s: 300
       min_interval_s: 60
@@ -1120,10 +1175,12 @@ heating:
         - start: \"07:00\"
           end: \"22:00\"
           target_temperature: 22.0
-      camera_ip_address: 192.168.1.154
+      presence:
+        device_type: camera
+        ip_address: 192.168.1.154
+        window_s: 900
       sensor_location: Living Room
       deadband: 0.25
-      presence_window_s: 900
       reading_max_age_s: 900
       interval_s: 300
       min_interval_s: 60
@@ -1151,10 +1208,12 @@ heating:
           target_temperature: 22.0
           require_presence: true
           deadband: 0.5
-      camera_ip_address: 192.168.1.154
+      presence:
+        device_type: camera
+        ip_address: 192.168.1.154
+        window_s: 900
       sensor_location: Living Room
       deadband: 0.25
-      presence_window_s: 900
       reading_max_age_s: 900
       interval_s: 300
       min_interval_s: 60
@@ -1187,11 +1246,13 @@ heating:
         start: \"07:30\"
         end: \"22:00\"
         time_zone: Europe/London
-      camera_ip_address: 192.168.1.154
+      presence:
+        device_type: camera
+        ip_address: 192.168.1.154
+        window_s: 900
       sensor_location: Living Room
       target_temperature: 22.0
       deadband: 0.25
-      presence_window_s: 900
       reading_max_age_s: 900
       interval_s: 300
       min_interval_s: 60
@@ -1201,6 +1262,118 @@ heating:
         let error = parse(&yaml).expect_err("unknown keys are rejected");
         assert!(
             error.to_string().contains("unknown field"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A valid thermostat but for its presence, which is `keys`: lines of the thermostat's own
+    /// keys, indented by six spaces.
+    fn yaml_with_presence(keys: &str) -> String {
+        format!(
+            "{YAML_HEAD}
+  thermostats:
+    - name: Living Room
+      enabled: true
+      time_zone: Europe/London
+      active_periods:
+        - start: \"07:00\"
+          end: \"22:00\"
+          target_temperature: 22.0
+          require_presence: true
+{keys}
+      sensor_location: Living Room
+      deadband: 0.25
+      reading_max_age_s: 900
+      interval_s: 300
+      min_interval_s: 60
+"
+        )
+    }
+
+    const PRESENCE_YAML: &str = "      presence:
+        device_type: camera
+        ip_address: 192.168.1.154
+        window_s: 900";
+
+    #[test]
+    fn camera_presence_sources_are_read_from_yaml() {
+        for device_type in ["camera", "camera_ptz"] {
+            let yaml = yaml_with_presence(&format!(
+                "      presence:
+        device_type: {device_type}
+        ip_address: 192.168.1.154
+        window_s: 900"
+            ));
+
+            let settings = parse(&yaml).unwrap();
+            settings.validate().unwrap();
+
+            let presence = &settings.heating.unwrap().thermostats[0].presence;
+            assert_eq!(
+                matches!(presence, PresenceSource::Camera { .. }),
+                device_type == "camera"
+            );
+            assert_eq!(presence.device_type(), device_type);
+            assert_eq!(presence.ip_address(), "192.168.1.154");
+            assert_eq!(presence.window_s(), 900);
+        }
+    }
+
+    #[test]
+    fn unknown_key_in_presence_is_rejected() {
+        let yaml = yaml_with_presence(&format!("{PRESENCE_YAML}\n        name: Hallway"));
+
+        let error = parse(&yaml).expect_err("a camera has no name");
+        assert!(
+            error.to_string().contains("unknown field"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn unknown_presence_device_type_is_rejected() {
+        for device_type in ["t100", "plug"] {
+            let yaml = yaml_with_presence(&format!(
+                "      presence:
+        device_type: {device_type}
+        ip_address: 192.168.1.154
+        window_s: 900"
+            ));
+
+            let error = parse(&yaml)
+                .expect_err("the device type does not exist")
+                .to_string();
+            assert!(
+                error.contains("unknown variant"),
+                "device_type {device_type}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn presence_in_the_old_shape_is_rejected() {
+        // The keys of the release before the presence block: the camera's address and the
+        // window on the thermostat. Each has to fail rather than be ignored.
+        for key in ["camera_ip_address: 192.168.1.154", "presence_window_s: 900"] {
+            let yaml = yaml_with_presence(&format!("{PRESENCE_YAML}\n      {key}"));
+
+            let error = parse(&yaml)
+                .expect_err("unknown keys are rejected")
+                .to_string();
+            assert!(error.contains("unknown field"), "{key}: {error}");
+        }
+    }
+
+    #[test]
+    fn thermostat_without_presence_is_rejected() {
+        let error = parse(&yaml_with_presence(""))
+            .expect_err("presence is required")
+            .to_string();
+
+        assert!(
+            error.contains("missing configuration field")
+                && error.ends_with("presence\"")
+                && !error.contains("require_presence"),
             "unexpected error: {error}"
         );
     }

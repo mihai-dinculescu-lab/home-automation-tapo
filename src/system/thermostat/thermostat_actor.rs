@@ -16,9 +16,9 @@ use crate::{
         SensorReading, SensorReadingMessage, StopMessage, ThermostatDecisionMessage,
     },
     system::thermostat::decision::{
-        Decision, Evaluation, HeaterCommand, HeaterSwitch, Presence, PresenceError, Reason,
-        SwitchOutcome, decide, person_present,
+        Decision, Evaluation, HeaterCommand, HeaterSwitch, Presence, Reason, SwitchOutcome, decide,
     },
+    system::thermostat::presence,
     telemetry::{consumer_span, record_error, set_parent_context},
 };
 
@@ -28,8 +28,8 @@ pub struct ThermostatActor {
     /// The topic the decisions are published on.
     decisions_publish_topic: String,
     device_sessions: DeviceSessions,
-    /// The credentials the camera is queried with; it has no session to share, so it is not
-    /// reached through `device_sessions`.
+    /// The credentials the presence source is queried with; it has no session to share, so it
+    /// is not reached through `device_sessions`.
     tapo: Tapo,
     config: Thermostat,
     /// The latest reading for `sensor_location`. `None` until the first one arrives, since the
@@ -202,15 +202,15 @@ impl ThermostatActor {
     /// it decided for the deadband to repeat.
     ///
     /// Only what the period needs is used: outside every period nothing is, not even `reading`,
-    /// and inside one the camera is only consulted when the period requires presence.
+    /// and inside one the presence source is only consulted when the period requires presence.
     ///
-    /// A camera failure is recorded on the camera's span but does not fail the tick: it is a
-    /// normal `Off` decision.
+    /// A failure of the presence source is recorded on the query's span but does not fail the
+    /// tick: it is a normal `Off` decision.
     #[instrument(name = "ThermostatActor::evaluate", skip_all, fields(
         thermostat.name = %config.name,
         thermostat.target_temperature = tracing::field::Empty,
         thermostat.require_presence = tracing::field::Empty,
-        thermostat.person_detected = tracing::field::Empty,
+        thermostat.presence_detected = tracing::field::Empty,
         thermostat.temperature = tracing::field::Empty,
         thermostat.reading_age_s = tracing::field::Empty,
         thermostat.command = tracing::field::Empty,
@@ -257,8 +257,8 @@ impl ThermostatActor {
             decision,
         };
 
-        if let Some(Ok(person_detected)) = evaluation.presence {
-            span.record("thermostat.person_detected", person_detected);
+        if let Some(Ok(presence_detected)) = evaluation.presence {
+            span.record("thermostat.presence_detected", presence_detected);
         }
         if let Some(reading) = &evaluation.reading {
             span.record("thermostat.temperature", reading.temperature);
@@ -299,34 +299,13 @@ impl ThermostatActor {
     }
 
     #[instrument(name = "ThermostatActor::query_presence", skip_all, fields(
-        camera.ip_address = %config.camera_ip_address,
+        presence.device_type = config.presence.device_type(),
+        presence.ip_address = %config.presence.ip_address(),
     ))]
     async fn query_presence(tapo: &Tapo, config: &Thermostat, now: DateTime<Utc>) -> Presence {
-        let window_start = now - chrono::Duration::seconds(config.presence_window_s as i64);
+        let window_start = now - chrono::Duration::seconds(config.presence.window_s() as i64);
 
-        // The camera is only ever queried here, and a tick cancels the previous one, so it has
-        // no session to share.
-        let result = async {
-            let handler = tapo.client().c120(config.camera_ip_address.clone()).await?;
-
-            handler.get_detections(window_start, now).await
-        }
-        .await;
-
-        match result {
-            Ok(detections) => {
-                debug!(
-                    "Thermostat '{}': {} detections in the presence window",
-                    config.name,
-                    detections.len()
-                );
-                Ok(person_present(&detections, window_start))
-            }
-            Err(e) => {
-                record_error!(&e);
-                Err(PresenceError)
-            }
-        }
+        presence::query(tapo, &config.presence, window_start, now).await
     }
 
     #[instrument(name = "ThermostatActor::switch_heater", skip_all, fields(

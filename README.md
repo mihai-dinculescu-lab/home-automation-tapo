@@ -77,7 +77,7 @@ subscribes, and a thermostat that is restarted has none until the next one arriv
 
 Each enabled entry in `heating.thermostats` is evaluated on every reading for its `sensor_location`, and every
 `interval_s` seconds while none arrives, under the rule of the active period containing the current time. The heaters
-are turned **on** when a person was detected by the camera in the last `presence_window_s` seconds and the latest
+are turned **on** when a person was detected by the camera in the last `presence.window_s` seconds and the latest
 sensor reading for `sensor_location` is under the period's `target_temperature - deadband`. They are turned **off**
 when nobody was detected, the camera cannot be queried, the reading is missing or older than `reading_max_age_s`
 seconds, or the temperature is above `target_temperature + deadband`. In between, the last command is repeated, so
@@ -98,10 +98,13 @@ shutdown: the next start asserts the heaters on its first tick.
 The readings are not retained, so none is known right after a start and the heaters are turned off until the first
 one arrives. This also covers plugs left on by a run that crashed.
 
-The readings are the ones sent by the [Sensors](#sensors) subscription, matched on `sensor_location`. Person
+The readings are the ones sent by the [Sensors](#sensors) subscription, matched on `sensor_location`.
+
+`presence` names the camera that decides presence. Its `device_type` is the Tapo handler the camera is reached
+through: `camera` for the C120, and `camera_ptz` for the C210, C220, C225, C325WB, C520WS, TC40 and TC70. Person
 detection is read from the camera's SD card through `get_detections`, so it has to be enabled in the Tapo app, and
-`presence_window_s` is capped at 24 hours by the camera. It also has to be at least `interval_s`, otherwise a person
-detected between two ticks can go unnoticed.
+`presence.window_s` is capped at 24 hours by the camera. It also has to be at least `interval_s`, otherwise a person
+detected between two ticks can go unnoticed. The block is required even when no period requires presence.
 
 `active_periods` lists the parts of the day in which a thermostat runs, each from `start` (inclusive) to `end`
 (exclusive) as `HH:MM` in the thermostat's `time_zone` (an IANA name such as `Europe/London`); an `end` before
@@ -130,18 +133,19 @@ stopped thermostat or an undeliverable command is built on.
   "command": "on",
   "reason": "below_target",
   "active_period": { "start": "07:00", "end": "22:00", "target_temperature": 21.0, "require_presence": true },
-  "person_detected": true,
+  "presence_detected": true,
   "temperature": 20.1,
   "reading_age_s": 42,
   "heaters": [{ "name": "Radiator", "outcome": "switched" }]
 }
 ```
 
-- `reason` is one of `outside_active_period`, `camera_error`, `nobody_present`, `no_reading`, `stale_reading`,
+- `reason` is one of `outside_active_period`, `presence_error`, `nobody_present`, `no_reading`, `stale_reading`,
   `above_target`, `below_target` and `within_deadband`.
 - `active_period` is the period the tick ran under, with its times in the thermostat's `time_zone`; it is `null`
   outside every period, and so is every input, since nothing is queried there.
-- `person_detected` is `null` when the period does not require presence or the camera could not be queried.
+- `presence_detected` is `null` when the period does not require presence or the camera could not be queried, which
+  is the reason `presence_error`.
 - `temperature` and `reading_age_s` are `null` when there is no reading for `sensor_location`.
 - `heaters` lists every heater in the order of the settings with the `outcome` of its switch: `switched`, `failed`, or
   `shutting_down` when the service was stopping and the command was not sent.
@@ -172,10 +176,10 @@ fully met yet and are marked as such.
    starts. Outside every period it switches the heaters off; inside one, no reading and no last command are known yet,
    either of which decides Off. This covers plugs left on by a run that crashed, was killed or was stopped.
 5. **Unknown decides Off.** A camera that cannot be queried, nobody present, a missing reading and a stale reading all
-   switch off. On requires a fresh reading below the band, and a person present in any period that requires it. A
+   switch off; the first is a `presence_error`, never read as nobody present. On requires a fresh reading below the band, and a person present in any period that requires it. A
    period with `require_presence: false` is an explicit, logged opt-out, so property 12 still holds.
 6. **Exposure is bounded once a trigger disappears.** After a person leaves or a sensor falls silent, the heaters are
-   off within `presence_window_s` or `reading_max_age_s` plus one interval. Periods that do not require presence
+   off within `presence.window_s` or `reading_max_age_s` plus one interval. Periods that do not require presence
    are not bounded by the presence window: the heaters can run on the reading alone until the next period that
    requires presence or the next gap, plus one interval. A schedule in which no period requires presence is bounded
    by `reading_max_age_s` only.
