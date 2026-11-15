@@ -53,13 +53,23 @@ heating:
           # whether the heaters are only switched on while a person is present; `false` heats the
           # room regardless, e.g. before anyone is up
           require_presence:
-      # the device whose person detections decide presence
+      # the device that decides presence: a camera's person detections, or a T100's motion
       presence:
         # the Tapo handler of the device: camera (C120) | camera_ptz (C210, C220, C225, C325WB,
-        # C520WS, TC40, TC70)
+        # C520WS, TC40, TC70) | t100
         device_type:
+        # t100 only; delete this key for a camera. The Tapo handler of the hub the sensor is
+        # paired with: hub (H100) | hub_ir (H110) | camera_hub (H200, H500)
+        hub_type:
+        # the device's name in the Tapo app: the camera's, or the sensor's for a t100, which has
+        # to be the only t100 of that name on its hub. A device that carries another name is a
+        # presence error, which switches the heaters off in a period that requires presence
+        name:
+        # the camera's address, or the hub's for a t100
         ip_address:
-        # a person detected this many seconds ago still counts as present, at least interval_s and at most 86400 (24 hours)
+        # presence this many seconds ago still counts, at least interval_s and at most 86400
+        # (24 hours); a t100 detects motion rather than people, so it needs a longer window
+        # than a camera
         window_s:
       # matches the `location` field of the sensor payload
       sensor_location:

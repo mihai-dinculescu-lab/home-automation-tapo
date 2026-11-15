@@ -167,6 +167,7 @@ mod tests {
             active_periods: vec![period("08:00", "22:00", 22.0)],
             presence: PresenceSource::Camera {
                 ip_address: "192.168.1.154".to_string(),
+                name: "Living Room Camera".to_string(),
                 window_s: 900,
             },
             sensor_location: "Living Room".to_string(),

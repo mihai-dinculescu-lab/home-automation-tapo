@@ -77,13 +77,13 @@ subscribes, and a thermostat that is restarted has none until the next one arriv
 
 Each enabled entry in `heating.thermostats` is evaluated on every reading for its `sensor_location`, and every
 `interval_s` seconds while none arrives, under the rule of the active period containing the current time. The heaters
-are turned **on** when a person was detected by the camera in the last `presence.window_s` seconds and the latest
+are turned **on** when the presence source detected someone in the last `presence.window_s` seconds and the latest
 sensor reading for `sensor_location` is under the period's `target_temperature - deadband`. They are turned **off**
-when nobody was detected, the camera cannot be queried, the reading is missing or older than `reading_max_age_s`
-seconds, or the temperature is above `target_temperature + deadband`. In between, the last command is repeated, so
-that they do not cycle around the setpoint; right after a start there is no last command and they are turned off. A
-period with `require_presence: false` skips the camera and heats the room on the reading alone, e.g. before anyone
-is up.
+when nobody was detected, the presence source cannot be queried, the reading is missing or older than
+`reading_max_age_s` seconds, or the temperature is above `target_temperature + deadband`. In between, the last
+command is repeated, so that they do not cycle around the setpoint; right after a start there is no last command and
+they are turned off. A period with `require_presence: false` skips the presence source and heats the room on the
+reading alone, e.g. before anyone is up.
 
 The ticks follow the sensor rather than a clock of their own: every reading starts a tick, so it is evaluated as it
 arrives, and every tick schedules the next one `interval_s` on in case no reading comes first. A sensor that falls
@@ -100,11 +100,25 @@ one arrives. This also covers plugs left on by a run that crashed.
 
 The readings are the ones sent by the [Sensors](#sensors) subscription, matched on `sensor_location`.
 
-`presence` names the camera that decides presence. Its `device_type` is the Tapo handler the camera is reached
-through: `camera` for the C120, and `camera_ptz` for the C210, C220, C225, C325WB, C520WS, TC40 and TC70. Person
-detection is read from the camera's SD card through `get_detections`, so it has to be enabled in the Tapo app, and
-`presence.window_s` is capped at 24 hours by the camera. It also has to be at least `interval_s`, otherwise a person
-detected between two ticks can go unnoticed. The block is required even when no period requires presence.
+`presence` names the device that decides presence. Its `device_type` is the Tapo handler the device is reached
+through: `camera` for the C120, `camera_ptz` for the C210, C220, C225, C325WB, C520WS, TC40 and TC70, and `t100` for
+a T100 motion sensor. `presence.window_s` is capped at 24 hours, the longest a camera accepts, for every source. It
+also has to be at least `interval_s`, otherwise presence detected between two ticks can go unnoticed. The block is
+required even when no period requires presence.
+
+A camera's person detection is read from its SD card through `get_detections`, so it has to be enabled in the Tapo
+app. `name` is the camera's name in the Tapo app, and every query checks that the device at `ip_address` carries it:
+an address that has moved to another camera, or a camera that was renamed, is a `presence_error` until the settings
+follow, rather than another room's presence.
+
+A T100 is reached through the hub it is paired with: `hub_type` names the hub's Tapo handler, `hub` for the H100,
+`hub_ir` for the H110 and `camera_hub` for the H200 and H500, `ip_address` is the hub's, and `name` is the sensor's
+name in the Tapo app. Someone counts as present when the sensor's newest trigger log falls inside the window. The
+sensor detects motion rather than people, so a pet counts and someone sitting still does not: it needs a longer
+`window_s` than a camera. The sensor is looked up by `name` on every query, so renaming it in the Tapo app is a
+`presence_error` until the settings follow, and so are a sensor the hub reports as offline and two T100s on the hub
+that share the name. The log's time is the hub's, so a hub whose clock runs ahead stretches the window by the
+difference, and one whose clock runs behind shortens it, down to nobody ever present once it is behind by `window_s`.
 
 `active_periods` lists the parts of the day in which a thermostat runs, each from `start` (inclusive) to `end`
 (exclusive) as `HH:MM` in the thermostat's `time_zone` (an IANA name such as `Europe/London`); an `end` before
@@ -144,8 +158,8 @@ stopped thermostat or an undeliverable command is built on.
   `above_target`, `below_target` and `within_deadband`.
 - `active_period` is the period the tick ran under, with its times in the thermostat's `time_zone`; it is `null`
   outside every period, and so is every input, since nothing is queried there.
-- `presence_detected` is `null` when the period does not require presence or the camera could not be queried, which
-  is the reason `presence_error`.
+- `presence_detected` is `null` when the period does not require presence or the presence source could not be
+  queried, which is the reason `presence_error`. From a T100 it means motion, not necessarily a person.
 - `temperature` and `reading_age_s` are `null` when there is no reading for `sensor_location`.
 - `heaters` lists every heater in the order of the settings with the `outcome` of its switch: `switched`, `failed`, or
   `shutting_down` when the service was stopping and the command was not sent.
@@ -162,7 +176,7 @@ fully met yet and are marked as such.
 
 1. **A tick at least every `interval_s`.** Every tick schedules the next one a full interval on before it queries
    anything, and a reading only ever brings it forward. The tick loop never waits on the work it starts, and each
-   tick cancels the previous one if it is still running, so a slow camera or plug can neither block the next
+   tick cancels the previous one if it is still running, so a slow presence source or plug can neither block the next
    evaluation nor switch the heaters on older inputs. Every request to a device times out after 10 seconds, so even a
    tick that has to log in to a slow plug again ends within about a minute.
 2. **A stuck process is replaced within about a minute.** `/health-check` round-trips a probe to the coordinator actor
@@ -175,11 +189,16 @@ fully met yet and are marked as such.
 4. **Every start asserts Off within seconds, unless fresh inputs say On.** The first tick runs as soon as the actor
    starts. Outside every period it switches the heaters off; inside one, no reading and no last command are known yet,
    either of which decides Off. This covers plugs left on by a run that crashed, was killed or was stopped.
-5. **Unknown decides Off.** A camera that cannot be queried, nobody present, a missing reading and a stale reading all
-   switch off; the first is a `presence_error`, never read as nobody present. On requires a fresh reading below the band, and a person present in any period that requires it. A
-   period with `require_presence: false` is an explicit, logged opt-out, so property 12 still holds.
+5. **Unknown decides Off.** A presence source that cannot be queried, nobody present, a missing reading and a stale
+   reading all switch off; the first is a `presence_error`, never read as nobody present, and covers a camera or hub
+   that cannot be reached, a camera that carries another name than its `name`, a T100 the hub does not list under its
+   `name`, lists twice under it or reports as offline. On requires a
+   fresh reading below the band, and presence detected in any period that requires it. A period with
+   `require_presence: false` is an explicit, logged opt-out, so property 12 still holds.
 6. **Exposure is bounded once a trigger disappears.** After a person leaves or a sensor falls silent, the heaters are
-   off within `presence.window_s` or `reading_max_age_s` plus one interval. Periods that do not require presence
+   off within `presence.window_s` or `reading_max_age_s` plus one interval. A T100 is held to the same window: only
+   its timed trigger log is read, never its `detected` flag, which a sensor that died could leave set. A hub whose
+   clock runs ahead adds the difference to the bound. Periods that do not require presence
    are not bounded by the presence window: the heaters can run on the reading alone until the next period that
    requires presence or the next gap, plus one interval. A schedule in which no period requires presence is bounded
    by `reading_max_age_s` only.
@@ -198,7 +217,7 @@ fully met yet and are marked as such.
     period, Off outside it, and the last command within the deadband. A plug switched by hand is therefore corrected
     on the next tick wherever the temperature sits.
 11. **Reaching a safe state after a restart depends on nothing outside the LAN.** The settings come from a secret
-    already mounted, and MQTT or the camera being down decides Off. The image is still pulled on every restart, so a
+    already mounted, and MQTT or the presence source being down decides Off. The image is still pulled on every restart, so a
     registry outage can keep a replacement pod from starting.
 12. **Configuration cannot silently disable safety.** The settings are validated at startup and the service refuses to
     start on a zero interval, a presence window shorter than the interval, a period or a gap between two of them

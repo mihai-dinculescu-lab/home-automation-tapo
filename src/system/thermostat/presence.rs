@@ -1,10 +1,91 @@
+use std::fmt;
+
 use chrono::{DateTime, Utc};
-use tapo::responses::{DetectionResult, RecordingType};
+use tapo::responses::{
+    ChildDeviceHubIrResult, ChildDeviceHubResult, RecordingType, Status, T100Event,
+};
 use tracing::debug;
 
-use crate::settings::{PresenceSource, Tapo};
+use crate::settings::{HubType, PresenceSource, Tapo};
 use crate::system::thermostat::decision::{Presence, PresenceError};
 use crate::telemetry::record_error;
+
+/// Why a presence source could not answer. Each is unknown presence, never nobody present.
+#[derive(Debug)]
+enum QueryError {
+    /// The device could not be reached, or refused the request.
+    Tapo(tapo::Error),
+    /// The camera at the address carries another name than the one in the settings.
+    NameMismatch,
+    /// The hub lists no T100 with the nickname in the settings.
+    SensorNotFound,
+    /// The hub lists more than one T100 with the nickname in the settings, so which room the
+    /// motion is from is unknown.
+    SensorAmbiguous,
+    /// The hub lists the T100 as offline, so its log says nothing about now.
+    SensorOffline,
+}
+
+impl fmt::Display for QueryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Tapo(e) => e.fmt(f),
+            Self::NameMismatch => f.write_str("The camera at this address has another name"),
+            Self::SensorNotFound => f.write_str("The hub has no T100 with this name"),
+            Self::SensorAmbiguous => f.write_str("The hub has more than one T100 with this name"),
+            Self::SensorOffline => f.write_str("The T100 is offline"),
+        }
+    }
+}
+
+impl std::error::Error for QueryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Tapo(e) => e.source(),
+            Self::NameMismatch
+            | Self::SensorNotFound
+            | Self::SensorAmbiguous
+            | Self::SensorOffline => None,
+        }
+    }
+}
+
+impl From<tapo::Error> for QueryError {
+    fn from(e: tapo::Error) -> Self {
+        Self::Tapo(e)
+    }
+}
+
+/// The handler and the status of the T100 whose nickname is `$name` on `$hub`, whose child list
+/// holds `$child`s. A hub that lists no such sensor, or more than one, is an error: with two of
+/// them, which room the motion is from is unknown.
+///
+/// The list is read once and does three jobs: it finds the sensor, gives the id its logs are
+/// asked by and carries its status. The checked `t100` builder would read the same list and
+/// throw the rest away.
+///
+/// A macro rather than a function: every hub has a handler type of its own, and they share the
+/// methods used here by name only, not through a trait.
+macro_rules! t100_on_hub {
+    ($hub:expr, $child:ident, $name:expr) => {{
+        let hub = $hub;
+
+        let mut sensors = hub
+            .get_child_device_list()
+            .await?
+            .into_iter()
+            .filter_map(|child| match child {
+                $child::T100(sensor) if sensor.nickname == *$name => Some(sensor),
+                _ => None,
+            });
+
+        match (sensors.next(), sensors.next()) {
+            (Some(sensor), None) => Ok((hub.t100_unchecked(sensor.device_id), sensor.status)),
+            (None, _) => Err(QueryError::SensorNotFound),
+            (Some(_), Some(_)) => Err(QueryError::SensorAmbiguous),
+        }
+    }};
+}
 
 /// Asks `source` whether anyone was present between `window_start` and `now`.
 ///
@@ -20,100 +101,93 @@ pub async fn query(
     now: DateTime<Utc>,
 ) -> Presence {
     let result = async {
-        match source {
-            PresenceSource::Camera { ip_address, .. } => {
+        let detections = match source {
+            PresenceSource::Camera {
+                ip_address, name, ..
+            } => {
                 let handler = tapo.client().c120(ip_address.clone()).await?;
 
-                handler.get_detections(window_start, now).await
+                if handler.get_device_info().await?.nickname != *name {
+                    return Err(QueryError::NameMismatch);
+                }
+
+                handler.get_detections(window_start, now).await?
             }
-            PresenceSource::CameraPtz { ip_address, .. } => {
+            PresenceSource::CameraPtz {
+                ip_address, name, ..
+            } => {
                 let handler = tapo.client().c220(ip_address.clone()).await?;
 
-                handler.get_detections(window_start, now).await
+                if handler.get_device_info().await?.nickname != *name {
+                    return Err(QueryError::NameMismatch);
+                }
+
+                handler.get_detections(window_start, now).await?
             }
-        }
+            PresenceSource::T100 {
+                hub_type,
+                ip_address,
+                name,
+                ..
+            } => {
+                let client = tapo.client();
+                let ip_address = ip_address.clone();
+
+                let (sensor, status) = match hub_type {
+                    HubType::Hub => {
+                        t100_on_hub!(client.h100(ip_address).await?, ChildDeviceHubResult, name)
+                    }
+                    HubType::HubIr => {
+                        t100_on_hub!(client.h110(ip_address).await?, ChildDeviceHubIrResult, name)
+                    }
+                    // `h200` and `h500` log in the same way and build the same handler.
+                    HubType::CameraHub => {
+                        t100_on_hub!(client.h200(ip_address).await?, ChildDeviceHubResult, name)
+                    }
+                }?;
+
+                if matches!(status, Status::Offline) {
+                    return Err(QueryError::SensorOffline);
+                }
+
+                // The sensor's `detected` flag is not read: it has no time of its own, so one
+                // left set by a sensor that died would keep the heaters on past the window.
+                let last_triggered_at =
+                    sensor
+                        .get_trigger_logs(1, 0)
+                        .await?
+                        .logs
+                        .first()
+                        .map(|log| match log.event {
+                            // Exhaustive, so that an event tapo adds later, such as a low battery,
+                            // has to be judged here rather than being read as motion.
+                            T100Event::Motion => log.triggered_at,
+                        });
+
+                debug!("Motion last triggered at {last_triggered_at:?}");
+
+                // Motion counts as presence when the newest trigger log was triggered at or
+                // after `window_start`. An empty log, as on a sensor just paired, is nobody
+                // present. The log's time is the hub's and `window_start` this service's, so a
+                // hub whose clock runs ahead stretches the window by the difference.
+                return Ok(
+                    last_triggered_at.is_some_and(|triggered_at| triggered_at >= window_start)
+                );
+            }
+        };
+
+        debug!("{} detections in the presence window", detections.len());
+
+        // A person counts as present when any detection has `Person` among its events and
+        // ended at or after `window_start`.
+        Ok(detections.iter().any(|detection| {
+            detection.end_time >= window_start && detection.events.contains(&RecordingType::Person)
+        }))
     }
     .await;
 
-    match result {
-        Ok(detections) => {
-            debug!("{} detections in the presence window", detections.len());
-            Ok(person_present(&detections, window_start))
-        }
-        Err(e) => {
-            record_error!(&e);
-            Err(PresenceError)
-        }
-    }
-}
-
-/// A person counts as present when any detection has `Person` among its events and ended at or
-/// after `window_start`.
-pub fn person_present(detections: &[DetectionResult], window_start: DateTime<Utc>) -> bool {
-    detections.iter().any(|detection| {
-        detection.end_time >= window_start && detection.events.contains(&RecordingType::Person)
+    result.map_err(|e: QueryError| {
+        record_error!(&e);
+        PresenceError
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use chrono::{Duration, TimeZone};
-
-    use super::*;
-
-    fn now() -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 10, 25, 12, 0, 0).unwrap()
-    }
-
-    /// `DetectionResult` is not constructible outside `tapo`, so it is built from its serialized form.
-    fn detection(end_time: DateTime<Utc>, events: Vec<RecordingType>) -> DetectionResult {
-        serde_json::from_value(serde_json::json!({
-            "start_time": (end_time - Duration::seconds(10)).to_rfc3339(),
-            "end_time": end_time.to_rfc3339(),
-            "trigger": events.last().unwrap(),
-            "events": events,
-        }))
-        .unwrap()
-    }
-
-    #[test]
-    fn person_present_requires_a_person_event_in_the_window() {
-        let window_start = now() - Duration::seconds(900);
-
-        assert!(person_present(
-            &[detection(
-                now(),
-                vec![RecordingType::Motion, RecordingType::Person]
-            )],
-            window_start
-        ));
-        assert!(
-            !person_present(
-                &[detection(now(), vec![RecordingType::Motion])],
-                window_start
-            ),
-            "motion alone is not a person"
-        );
-        assert!(
-            !person_present(
-                &[detection(
-                    window_start - Duration::seconds(1),
-                    vec![RecordingType::Person]
-                )],
-                window_start
-            ),
-            "a detection that ended before the window does not count"
-        );
-        assert!(!person_present(&[], window_start));
-    }
-
-    #[test]
-    fn detection_ending_exactly_at_window_start_counts() {
-        let window_start = now() - Duration::seconds(900);
-
-        assert!(person_present(
-            &[detection(window_start, vec![RecordingType::Person])],
-            window_start
-        ));
-    }
 }

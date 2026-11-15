@@ -301,6 +301,7 @@ impl ThermostatActor {
     #[instrument(name = "ThermostatActor::query_presence", skip_all, fields(
         presence.device_type = config.presence.device_type(),
         presence.ip_address = %config.presence.ip_address(),
+        presence.name = %config.presence.name(),
     ))]
     async fn query_presence(tapo: &Tapo, config: &Thermostat, now: DateTime<Utc>) -> Presence {
         let window_start = now - chrono::Duration::seconds(config.presence.window_s() as i64);

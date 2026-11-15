@@ -200,6 +200,10 @@ pub enum PresenceSource {
     /// The `CameraHandler`: C120.
     Camera {
         ip_address: String,
+        /// The camera's name in the Tapo app. Every query checks that the device at
+        /// `ip_address` carries it, so an address that has moved to another device is a
+        /// presence error rather than another room's presence.
+        name: String,
         /// A person detected this many seconds ago still counts as present. At least
         /// `interval_s` and at most 24 hours.
         window_s: u64,
@@ -208,8 +212,36 @@ pub enum PresenceSource {
     CameraPtz {
         ip_address: String,
         /// As on `Camera`.
+        name: String,
+        /// As on `Camera`.
         window_s: u64,
     },
+    /// The `T100Handler`: a T100 motion sensor, reached through the hub it is paired with.
+    T100 {
+        /// The Tapo handler of the hub: a T100 can be paired with more than one kind.
+        hub_type: HubType,
+        /// The hub's address.
+        ip_address: String,
+        /// The sensor's nickname in the Tapo app, which it is looked up by on every query.
+        /// Renaming the sensor there makes every query a presence error until this follows,
+        /// and so does a second T100 with the same nickname on the hub.
+        name: String,
+        /// Motion this many seconds ago still counts as presence. Bounded as on `Camera`.
+        window_s: u64,
+    },
+}
+
+/// The hub a T100 is paired with, named by its Tapo handler as `PresenceSource` is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HubType {
+    /// The `HubHandler`: H100.
+    Hub,
+    /// The `HubIrHandler`: H110.
+    HubIr,
+    /// The `CameraHubHandler`: H200, H500. It is logged into with the password only; the
+    /// username is ignored.
+    CameraHub,
 }
 
 impl PresenceSource {
@@ -218,19 +250,35 @@ impl PresenceSource {
         match self {
             Self::Camera { .. } => "camera",
             Self::CameraPtz { .. } => "camera_ptz",
+            Self::T100 { .. } => "t100",
         }
     }
 
+    /// The address that is logged into: the camera's, or the hub's for a T100.
     pub fn ip_address(&self) -> &str {
         match self {
-            Self::Camera { ip_address, .. } | Self::CameraPtz { ip_address, .. } => ip_address,
+            Self::Camera { ip_address, .. }
+            | Self::CameraPtz { ip_address, .. }
+            | Self::T100 { ip_address, .. } => ip_address,
+        }
+    }
+
+    /// The device's name in the Tapo app: the one a camera is checked against, and the one a
+    /// T100 is looked up by on its hub.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Camera { name, .. } | Self::CameraPtz { name, .. } | Self::T100 { name, .. } => {
+                name
+            }
         }
     }
 
     /// Presence this many seconds ago still counts.
     pub fn window_s(&self) -> u64 {
         match self {
-            Self::Camera { window_s, .. } | Self::CameraPtz { window_s, .. } => *window_s,
+            Self::Camera { window_s, .. }
+            | Self::CameraPtz { window_s, .. }
+            | Self::T100 { window_s, .. } => *window_s,
         }
     }
 }
@@ -599,6 +647,7 @@ mod tests {
     fn camera(window_s: u64) -> PresenceSource {
         PresenceSource::Camera {
             ip_address: "192.168.1.154".to_string(),
+            name: "Living Room Camera".to_string(),
             window_s,
         }
     }
@@ -1134,6 +1183,7 @@ heating:
       presence:
         device_type: camera
         ip_address: 192.168.1.154
+        name: Living Room Camera
         window_s: 900
       sensor_location: Living Room
       deadband: 0.25
@@ -1178,6 +1228,7 @@ heating:
       presence:
         device_type: camera
         ip_address: 192.168.1.154
+        name: Living Room Camera
         window_s: 900
       sensor_location: Living Room
       deadband: 0.25
@@ -1211,6 +1262,7 @@ heating:
       presence:
         device_type: camera
         ip_address: 192.168.1.154
+        name: Living Room Camera
         window_s: 900
       sensor_location: Living Room
       deadband: 0.25
@@ -1249,6 +1301,7 @@ heating:
       presence:
         device_type: camera
         ip_address: 192.168.1.154
+        name: Living Room Camera
         window_s: 900
       sensor_location: Living Room
       target_temperature: 22.0
@@ -1293,6 +1346,7 @@ heating:
     const PRESENCE_YAML: &str = "      presence:
         device_type: camera
         ip_address: 192.168.1.154
+        name: Living Room Camera
         window_s: 900";
 
     #[test]
@@ -1302,6 +1356,7 @@ heating:
                 "      presence:
         device_type: {device_type}
         ip_address: 192.168.1.154
+        name: Living Room Camera
         window_s: 900"
             ));
 
@@ -1315,15 +1370,16 @@ heating:
             );
             assert_eq!(presence.device_type(), device_type);
             assert_eq!(presence.ip_address(), "192.168.1.154");
+            assert_eq!(presence.name(), "Living Room Camera");
             assert_eq!(presence.window_s(), 900);
         }
     }
 
     #[test]
     fn unknown_key_in_presence_is_rejected() {
-        let yaml = yaml_with_presence(&format!("{PRESENCE_YAML}\n        name: Hallway"));
+        let yaml = yaml_with_presence(&format!("{PRESENCE_YAML}\n        hub_type: hub"));
 
-        let error = parse(&yaml).expect_err("a camera has no name");
+        let error = parse(&yaml).expect_err("a camera has no hub");
         assert!(
             error.to_string().contains("unknown field"),
             "unexpected error: {error}"
@@ -1332,11 +1388,13 @@ heating:
 
     #[test]
     fn unknown_presence_device_type_is_rejected() {
-        for device_type in ["t100", "plug"] {
+        // `hub` is how the T100's hub is named, not a source of its own.
+        for device_type in ["hub", "plug"] {
             let yaml = yaml_with_presence(&format!(
                 "      presence:
         device_type: {device_type}
         ip_address: 192.168.1.154
+        name: Living Room Camera
         window_s: 900"
             ));
 
@@ -1346,6 +1404,86 @@ heating:
             assert!(
                 error.contains("unknown variant"),
                 "device_type {device_type}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn camera_without_name_is_rejected() {
+        for device_type in ["camera", "camera_ptz"] {
+            let yaml = yaml_with_presence(&format!(
+                "      presence:
+        device_type: {device_type}
+        ip_address: 192.168.1.154
+        window_s: 900"
+            ));
+
+            let error = parse(&yaml).expect_err("name is required").to_string();
+            assert!(
+                error.contains("missing configuration field") && error.ends_with("name\""),
+                "device_type {device_type}: {error}"
+            );
+        }
+    }
+
+    /// A T100 presence block whose hub is `hub_type_line`, a line indented by eight spaces, or
+    /// nothing.
+    fn t100_yaml(hub_type_line: &str) -> String {
+        yaml_with_presence(&format!(
+            "      presence:
+        device_type: t100
+{hub_type_line}
+        ip_address: 192.168.1.160
+        name: Living Room Motion
+        window_s: 1800"
+        ))
+    }
+
+    #[test]
+    fn t100_presence_source_is_read_from_yaml() {
+        for (written, expected) in [
+            ("hub", HubType::Hub),
+            ("hub_ir", HubType::HubIr),
+            ("camera_hub", HubType::CameraHub),
+        ] {
+            let settings = parse(&t100_yaml(&format!("        hub_type: {written}"))).unwrap();
+            settings.validate().unwrap();
+
+            let presence = &settings.heating.unwrap().thermostats[0].presence;
+            assert!(
+                matches!(presence, PresenceSource::T100 { hub_type, .. } if *hub_type == expected),
+                "hub_type {written}: {presence:?}"
+            );
+            assert_eq!(presence.device_type(), "t100");
+            assert_eq!(presence.ip_address(), "192.168.1.160");
+            assert_eq!(presence.name(), "Living Room Motion");
+            assert_eq!(presence.window_s(), 1800);
+        }
+    }
+
+    #[test]
+    fn t100_without_hub_type_is_rejected() {
+        let error = parse(&t100_yaml(""))
+            .expect_err("hub_type is required")
+            .to_string();
+
+        assert!(
+            error.contains("missing configuration field") && error.ends_with("hub_type\""),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn t100_with_an_unknown_hub_type_is_rejected() {
+        // The hub is named by its handler, not its model.
+        for hub_type in ["h100", "camera"] {
+            let error = parse(&t100_yaml(&format!("        hub_type: {hub_type}")))
+                .expect_err("the hub type does not exist")
+                .to_string();
+
+            assert!(
+                error.contains("unknown variant"),
+                "hub_type {hub_type}: {error}"
             );
         }
     }
