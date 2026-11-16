@@ -1314,11 +1314,7 @@ heating:
           end: \"22:00\"
           target_temperature: 22.0
           require_presence: true
-      presence:
-        device_type: camera
-        ip_address: 192.168.1.154
-        name: Living Room Camera
-        window_s: 900
+{PRESENCE_YAML}
       sensor_location: Living Room
       deadband: 0.25
       reading_max_age_s: 900
@@ -1359,11 +1355,7 @@ heating:
         - start: \"07:00\"
           end: \"22:00\"
           target_temperature: 22.0
-      presence:
-        device_type: camera
-        ip_address: 192.168.1.154
-        name: Living Room Camera
-        window_s: 900
+{PRESENCE_YAML}
       sensor_location: Living Room
       deadband: 0.25
       reading_max_age_s: 900
@@ -1393,11 +1385,7 @@ heating:
           target_temperature: 22.0
           require_presence: true
           deadband: 0.5
-      presence:
-        device_type: camera
-        ip_address: 192.168.1.154
-        name: Living Room Camera
-        window_s: 900
+{PRESENCE_YAML}
       sensor_location: Living Room
       deadband: 0.25
       reading_max_age_s: 900
@@ -1432,11 +1420,7 @@ heating:
         start: \"07:30\"
         end: \"22:00\"
         time_zone: Europe/London
-      presence:
-        device_type: camera
-        ip_address: 192.168.1.154
-        name: Living Room Camera
-        window_s: 900
+{PRESENCE_YAML}
       sensor_location: Living Room
       target_temperature: 22.0
       deadband: 0.25
@@ -1483,16 +1467,18 @@ heating:
         name: Living Room Camera
         window_s: 900";
 
+    /// `PRESENCE_YAML` with `device_type` in place of `camera`.
+    fn presence_yaml_of(device_type: &str) -> String {
+        PRESENCE_YAML.replace(
+            "device_type: camera",
+            &format!("device_type: {device_type}"),
+        )
+    }
+
     #[test]
     fn camera_presence_sources_are_read_from_yaml() {
         for device_type in ["camera", "camera_ptz"] {
-            let yaml = yaml_with_presence(&format!(
-                "      presence:
-        device_type: {device_type}
-        ip_address: 192.168.1.154
-        name: Living Room Camera
-        window_s: 900"
-            ));
+            let yaml = yaml_with_presence(&presence_yaml_of(device_type));
 
             let settings = parse(&yaml).unwrap();
             settings.validate().unwrap();
@@ -1524,13 +1510,7 @@ heating:
     fn unknown_presence_device_type_is_rejected() {
         // `hub` is how the T100's hub is named, not a source of its own.
         for device_type in ["hub", "plug"] {
-            let yaml = yaml_with_presence(&format!(
-                "      presence:
-        device_type: {device_type}
-        ip_address: 192.168.1.154
-        name: Living Room Camera
-        window_s: 900"
-            ));
+            let yaml = yaml_with_presence(&presence_yaml_of(device_type));
 
             let error = parse(&yaml)
                 .expect_err("the device type does not exist")
@@ -1545,12 +1525,9 @@ heating:
     #[test]
     fn camera_without_name_is_rejected() {
         for device_type in ["camera", "camera_ptz"] {
-            let yaml = yaml_with_presence(&format!(
-                "      presence:
-        device_type: {device_type}
-        ip_address: 192.168.1.154
-        window_s: 900"
-            ));
+            let yaml = yaml_with_presence(
+                &presence_yaml_of(device_type).replace("        name: Living Room Camera\n", ""),
+            );
 
             let error = parse(&yaml).expect_err("name is required").to_string();
             assert!(

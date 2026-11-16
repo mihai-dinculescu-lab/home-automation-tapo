@@ -1,6 +1,5 @@
-use std::fmt;
-
 use chrono::{DateTime, Utc};
+use derive_more::Display;
 use tapo::responses::{
     ChildDeviceHubIrResult, ChildDeviceHubResult, RecordingType, Status, T100Event,
 };
@@ -11,31 +10,24 @@ use crate::system::thermostat::decision::{Presence, PresenceError};
 use crate::telemetry::record_error;
 
 /// Why a presence source could not answer. Each is unknown presence, never nobody present.
-#[derive(Debug)]
+#[derive(Debug, Display)]
 enum QueryError {
     /// The device could not be reached, or refused the request.
+    #[display("{_0}")]
     Tapo(tapo::Error),
     /// The camera at the address carries another name than the one in the settings.
+    #[display("The camera at this address has another name")]
     NameMismatch,
     /// The hub lists no T100 with the nickname in the settings.
+    #[display("The hub has no T100 with this name")]
     SensorNotFound,
     /// The hub lists more than one T100 with the nickname in the settings, so which room the
     /// motion is from is unknown.
+    #[display("The hub has more than one T100 with this name")]
     SensorAmbiguous,
     /// The hub lists the T100 as offline, so its log says nothing about now.
+    #[display("The T100 is offline")]
     SensorOffline,
-}
-
-impl fmt::Display for QueryError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Tapo(e) => e.fmt(f),
-            Self::NameMismatch => f.write_str("The camera at this address has another name"),
-            Self::SensorNotFound => f.write_str("The hub has no T100 with this name"),
-            Self::SensorAmbiguous => f.write_str("The hub has more than one T100 with this name"),
-            Self::SensorOffline => f.write_str("The T100 is offline"),
-        }
-    }
 }
 
 impl std::error::Error for QueryError {
@@ -87,19 +79,16 @@ macro_rules! t100_on_hub {
     }};
 }
 
-/// Asks `source` whether anyone was present between `window_start` and `now`.
+/// Asks `source` whether anyone was present in its window, which ends at `now`.
 ///
 /// The device is only ever queried here, and a tick cancels the previous one, so it is logged
 /// into on every query rather than through a session.
 ///
 /// A failure is recorded on the caller's span and returned as unknown presence, never as nobody
 /// present.
-pub async fn query(
-    tapo: &Tapo,
-    source: &PresenceSource,
-    window_start: DateTime<Utc>,
-    now: DateTime<Utc>,
-) -> Presence {
+pub async fn query(tapo: &Tapo, source: &PresenceSource, now: DateTime<Utc>) -> Presence {
+    let window_start = now - chrono::Duration::seconds(source.window_s() as i64);
+
     let result = async {
         let detections = match source {
             PresenceSource::Camera {

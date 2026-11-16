@@ -221,30 +221,28 @@ impl ThermostatActor {
                 continue;
             }
 
-            let follow_up_actor_addr = self
+            let stopped = self
                 .follow_up_actor_addrs
-                .entry(index)
-                .and_modify(|addr| {
-                    if !addr.connected() {
-                        warn!(
-                            "The follow-up actor of heater '{}' has stopped, restarting it",
-                            heater.name
-                        );
-                        *addr = Self::start_follow_up(
-                            heater,
-                            bluetooth_address,
-                            *temperature,
-                            confirmation_max_age,
-                        );
-                    }
-                })
-                .or_insert_with(|| {
-                    Self::start_follow_up(
-                        heater,
-                        bluetooth_address,
+                .get(&index)
+                .is_some_and(|addr| !addr.connected());
+
+            if stopped {
+                warn!(
+                    "The follow-up actor of heater '{}' has stopped, restarting it",
+                    heater.name
+                );
+                self.follow_up_actor_addrs.remove(&index);
+            }
+
+            let follow_up_actor_addr =
+                self.follow_up_actor_addrs.entry(index).or_insert_with(|| {
+                    DimplexActor::new(
+                        heater.name.clone(),
+                        bluetooth_address.to_string(),
                         *temperature,
                         confirmation_max_age,
                     )
+                    .start()
                 });
 
             let message = HeaterPoweredOnMessage {
@@ -255,21 +253,6 @@ impl ThermostatActor {
                 record_error!(&e);
             }
         }
-    }
-
-    fn start_follow_up(
-        heater: &Heater,
-        bluetooth_address: &str,
-        temperature: u8,
-        confirmation_max_age: Duration,
-    ) -> Addr<DimplexActor> {
-        DimplexActor::new(
-            heater.name.clone(),
-            bluetooth_address.to_string(),
-            temperature,
-            confirmation_max_age,
-        )
-        .start()
     }
 
     /// Sends the tick's decision to be published, once the heaters have been switched, so that
@@ -425,9 +408,7 @@ impl ThermostatActor {
         presence.name = %config.presence.name(),
     ))]
     async fn query_presence(tapo: &Tapo, config: &Thermostat, now: DateTime<Utc>) -> Presence {
-        let window_start = now - chrono::Duration::seconds(config.presence.window_s() as i64);
-
-        presence::query(tapo, &config.presence, window_start, now).await
+        presence::query(tapo, &config.presence, now).await
     }
 
     #[instrument(name = "ThermostatActor::switch_heater", skip_all, fields(

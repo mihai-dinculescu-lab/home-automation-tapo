@@ -1,4 +1,3 @@
-use std::fmt;
 use std::time::Duration;
 
 use bluer::agent::{Agent, ReqError};
@@ -8,6 +7,7 @@ use bluer::{
     Adapter, AdapterEvent, Address, Device, DiscoveryFilter, DiscoveryTransport, InvalidAddress,
     Session, Uuid,
 };
+use derive_more::Display;
 use futures_util::{StreamExt, pin_mut};
 use tokio::time::{Instant, sleep, timeout, timeout_at};
 use tracing::{debug, warn};
@@ -38,44 +38,33 @@ const RETRIES: u32 = 5;
 const RETRY_DELAY: Duration = Duration::from_secs(2);
 
 /// Why the heater could not be put in Manual.
-#[derive(Debug)]
+#[derive(Debug, Display)]
 pub enum Error {
     /// `bluetooth_address` in the settings is not a Bluetooth address.
+    #[display("{_0}")]
     InvalidAddress(InvalidAddress),
     /// BlueZ could not be reached or failed a request: the adapter, the connection, the pairing,
     /// the read or the write.
+    #[display("{_0}")]
     Bluetooth(bluer::Error),
     /// The deadline passed before BlueZ answered, or with the heater known but not yet set, e.g.
     /// one held by the Remo app.
+    #[display(
+        "The heater was not put in Manual within {} seconds",
+        DEADLINE.as_secs()
+    )]
     Timeout,
     /// The heater did not advertise before the deadline, so BlueZ has no device to connect to:
     /// it is unpowered or out of range, or held by another connection.
+    #[display("The heater was not found over Bluetooth")]
     NotFound,
     /// The heater has no mode characteristic, so it is not the model this was written for.
+    #[display("The heater has no mode characteristic")]
     NoModeCharacteristic,
     /// The heater took the write but still reads back as another mode or setpoint, which is
     /// carried here.
+    #[display("The heater does not read back as Manual at the setpoint, but as {_0:02x?}")]
     NotApplied(Vec<u8>),
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidAddress(e) => e.fmt(f),
-            Self::Bluetooth(e) => e.fmt(f),
-            Self::Timeout => write!(
-                f,
-                "The heater was not put in Manual within {} seconds",
-                DEADLINE.as_secs()
-            ),
-            Self::NotFound => f.write_str("The heater was not found over Bluetooth"),
-            Self::NoModeCharacteristic => f.write_str("The heater has no mode characteristic"),
-            Self::NotApplied(frame) => write!(
-                f,
-                "The heater does not read back as Manual at the setpoint, but as {frame:02x?}"
-            ),
-        }
-    }
 }
 
 impl std::error::Error for Error {
