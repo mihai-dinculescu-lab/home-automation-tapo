@@ -1,13 +1,21 @@
 ---
 name: review-loop
-description: Run /code-review repeatedly on a target, fixing only findings that pass the review bar below, until three consecutive rounds accept nothing. Ends with /simplify and a summary for review. Does not commit.
+description: Run /simplify on a target, then /code-review repeatedly, fixing only findings that pass the review bar below, until two consecutive rounds accept nothing; simplify and review again until a whole review loop accepts nothing. Ends with a summary for review. Does not commit.
 ---
 
 # Review Loop
 
 Review a target until the reviews stop producing findings worth fixing, without letting the fixes complicate the code, the settings or the published payloads.
 
-The argument is the target, passed through to `/code-review` (a path, branch or PR number). With no argument, review the current diff, and name the untracked files to the reviewer, since a diff does not show them. Never stage or unstage anything: the fixes stay unstaged on top of the user's work.
+The argument is the target, passed through to `/simplify` and `/code-review` (a path, branch or PR number). With no argument, the target is the current diff; name the untracked files to the reviewer, since a diff does not show them. Never stage or unstage anything: the fixes stay unstaged on top of the user's work.
+
+## Order of work
+
+1. **Simplify the target.** Run `/simplify` on the changed code, before any review, so that the reviews read the code in its simplest form.
+2. **Review loop.** Run rounds as described below until two consecutive rounds accepted nothing.
+3. **Repeat while a loop accepts anything.** If the review loop accepted at least one finding, run `/simplify` again, this time on everything: the target and every fix made so far. Then run another review loop. Stop once a whole review loop accepted nothing.
+
+A `/simplify` pass must not change behaviour, settings keys, published payloads, span names or fields, or what the README says, and it leaves the review bar's reject list alone: no narrowing of `pub`, no dropped `enabled` flag. Run the checks after every pass that changed something.
 
 ## Each round
 
@@ -52,10 +60,9 @@ If a claim cannot be settled this way, reject it as "unconfirmed".
 
 ## Stopping
 
-Stop when three consecutive rounds accepted nothing, or after 24 rounds. Only accepted findings count; a reviewer can always produce something.
+A review loop ends when two consecutive rounds accepted nothing. The whole run ends when a review loop accepted nothing from its first round to its last, or after 24 rounds in total across every loop. Only accepted findings count; a reviewer can always produce something.
 
 Then:
 
-1. Run `/simplify` on the loop's fixes, if there were any, and the checks again.
-2. Summarise in chat: rounds run and why the loop stopped, a table of applied fixes (file, problem, change, evidence), a table of rejected findings with a one-line reason each, and any device calls made.
-3. Do not commit or stage. Wait for the user to review.
+1. Summarise in chat: the simplify passes and review loops run, with the rounds in each and why the run stopped, a table of applied fixes (file, problem, change, evidence), what each simplify pass changed, a table of rejected findings with a one-line reason each, and any device calls made.
+2. Do not commit or stage. Wait for the user to review.
