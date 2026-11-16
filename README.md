@@ -161,14 +161,17 @@ heaters:
   decides.
 - The heater's mode is read first and only written when it is not already Manual at `temperature`. Once that is
   confirmed the heater is left alone, so that the Remo app can connect to it, until the thermostat next decides to
-  switch the plug off; the next switch on confirms it again.
+  switch the plug off, or for three times `interval_s` while the plug stays on; the next tick that switches the
+  plug on then reads it again.
 - A failed attempt is recorded on its span, `DimplexActor::ensure_manual`, and made again on the next tick that
   switches the plug on. An attempt is given 45 seconds. The heater accepts one connection at a time, so an attempt
   fails while the Remo app holds it.
 - The follow-up never delays or changes the switching of the plug, which stays the only way the thermostat stops the
   heater, and its outcome is not part of the published [decision](#decisions).
 - A plug cut by anything but the thermostat, such as a mains blip or a switch by hand, leaves the heater in Standby
-  while it still counts as confirmed, until the thermostat next switches the plug off and on.
+  until the confirmation runs out, three times `interval_s` after it was made, and the next tick that switches the
+  plug on reads the heater again; a re-read that fails is made again on the tick after. The same re-read puts back a
+  mode or setpoint changed on the heater itself or in the Remo app while the plug is on.
 - No passkey is configured: the one the heater pairs with is derived from its address, and the host pairs by itself
   on the first attempt. Two enabled follow-ups of enabled thermostats with the same `bluetooth_address` are rejected
   at startup.

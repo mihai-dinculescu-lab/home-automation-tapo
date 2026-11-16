@@ -1,4 +1,5 @@
 use std::mem;
+use std::time::{Duration, Instant};
 
 use actix::{
     Actor, ActorContext, ActorFutureExt, AsyncContext, Context, Handler, SpawnHandle, WrapFuture,
@@ -19,6 +20,11 @@ pub struct DimplexActor {
     bluetooth_address: String,
     /// The setpoint in °C the heater is put in Manual at.
     temperature: u8,
+    /// How long a confirmation holds. Past it the heater is read again on the next "powered
+    /// on", since it loses its mode whenever its power is cut and not only when the thermostat
+    /// cuts it: a mains blip or a plug switched by hand leaves it in Standby just the same, and
+    /// so does its own button.
+    confirmation_max_age: Duration,
     state: State,
     /// How often the plug has been reported off. An attempt only counts if this is what it was
     /// when the attempt began: actix polls a cancelled future once more, so one that completes
@@ -34,9 +40,10 @@ enum State {
     /// An attempt is in flight. The thermostat reports the plug on every tick that switches it
     /// on, and one attempt at a time is enough.
     Attempting(SpawnHandle),
-    /// The heater was seen in Manual at the setpoint. It is not connected to again, so that the
-    /// link is left to the Remo app.
-    Confirmed,
+    /// The heater was seen in Manual at the setpoint at this time, on the monotonic clock. It
+    /// is not connected to again until that is `confirmation_max_age` ago, so that the link is
+    /// left to the Remo app in between.
+    Confirmed(Instant),
 }
 
 impl DimplexActor {
@@ -44,11 +51,17 @@ impl DimplexActor {
         heater.name = %heater_name,
         heater.bluetooth_address = %bluetooth_address,
     ))]
-    pub fn new(heater_name: String, bluetooth_address: String, temperature: u8) -> Self {
+    pub fn new(
+        heater_name: String,
+        bluetooth_address: String,
+        temperature: u8,
+        confirmation_max_age: Duration,
+    ) -> Self {
         Self {
             heater_name,
             bluetooth_address,
             temperature,
+            confirmation_max_age,
             state: State::Unconfirmed,
             power_offs: 0,
         }
@@ -100,8 +113,8 @@ impl Actor for DimplexActor {
 impl Handler<HeaterPoweredOnMessage> for DimplexActor {
     type Result = ();
 
-    /// Starts an attempt, unless one is running or the heater has been confirmed since its plug
-    /// was last switched off.
+    /// Starts an attempt, unless one is running or the heater was confirmed less than
+    /// `confirmation_max_age` ago, with no "powered off" since.
     fn handle(&mut self, message: HeaterPoweredOnMessage, ctx: &mut Context<Self>) -> Self::Result {
         let span = consumer_span!(
             name = "DimplexActor::Handler<HeaterPoweredOnMessage>",
@@ -118,10 +131,11 @@ impl Handler<HeaterPoweredOnMessage> for DimplexActor {
                 debug!("The previous attempt is still running");
                 return;
             }
-            State::Confirmed => {
+            State::Confirmed(at) if at.elapsed() < self.confirmation_max_age => {
                 debug!("The heater is already confirmed in Manual");
                 return;
             }
+            State::Confirmed(_) => debug!("The confirmation is too old, reading the heater again"),
         }
 
         let power_offs = self.power_offs;
@@ -138,7 +152,7 @@ impl Handler<HeaterPoweredOnMessage> for DimplexActor {
         .map(move |confirmed, act, _| {
             if act.power_offs == power_offs {
                 act.state = if confirmed {
-                    State::Confirmed
+                    State::Confirmed(Instant::now())
                 } else {
                     State::Unconfirmed
                 };

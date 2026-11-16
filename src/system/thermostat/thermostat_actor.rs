@@ -25,6 +25,9 @@ use crate::{
     telemetry::{consumer_span, record_error, set_parent_context},
 };
 
+/// How many of the thermostat's intervals a follow-up's confirmation of its heater holds.
+const FOLLOW_UP_CONFIRMATION_INTERVALS: u64 = 3;
+
 #[derive(Debug)]
 pub struct ThermostatActor {
     decision_recipient: Recipient<ThermostatDecisionMessage>,
@@ -193,6 +196,14 @@ impl ThermostatActor {
     /// can cancel, so a slow one is neither cut short by the next tick nor holds it up, and it
     /// never delays the switching of a plug.
     fn notify_heaters_powered_on(&mut self, heaters: &[HeaterSwitch]) {
+        // A heater confirmed in Manual is read again after this long with its plug on, so that
+        // one whose power was cut by anything but this thermostat is not left in Standby.
+        let confirmation_max_age = Duration::from_secs(
+            self.config
+                .interval_s
+                .saturating_mul(FOLLOW_UP_CONFIRMATION_INTERVALS),
+        );
+
         // `heaters` is in the order of the settings.
         let switches = self.config.heaters.iter().zip(heaters).enumerate();
 
@@ -219,10 +230,22 @@ impl ThermostatActor {
                             "The follow-up actor of heater '{}' has stopped, restarting it",
                             heater.name
                         );
-                        *addr = Self::start_follow_up(heater, bluetooth_address, *temperature);
+                        *addr = Self::start_follow_up(
+                            heater,
+                            bluetooth_address,
+                            *temperature,
+                            confirmation_max_age,
+                        );
                     }
                 })
-                .or_insert_with(|| Self::start_follow_up(heater, bluetooth_address, *temperature));
+                .or_insert_with(|| {
+                    Self::start_follow_up(
+                        heater,
+                        bluetooth_address,
+                        *temperature,
+                        confirmation_max_age,
+                    )
+                });
 
             let message = HeaterPoweredOnMessage {
                 span_context: tracing::Span::current().context(),
@@ -238,11 +261,13 @@ impl ThermostatActor {
         heater: &Heater,
         bluetooth_address: &str,
         temperature: u8,
+        confirmation_max_age: Duration,
     ) -> Addr<DimplexActor> {
         DimplexActor::new(
             heater.name.clone(),
             bluetooth_address.to_string(),
             temperature,
+            confirmation_max_age,
         )
         .start()
     }
