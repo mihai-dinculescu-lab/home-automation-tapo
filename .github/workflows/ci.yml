@@ -33,6 +33,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install libdbus
+        run: sudo apt-get update && sudo apt-get -y install libdbus-1-dev
       - name: Run format
         run: cargo make format
       - name: Run clippy

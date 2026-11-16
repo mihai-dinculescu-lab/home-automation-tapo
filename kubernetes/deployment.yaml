@@ -23,11 +23,19 @@ spec:
               value: "http://alloy.monitoring:4318"
             - name: OTEL_RESOURCE_ATTRIBUTES
               value: "service.namespace=home-automation,deployment.environment.name=production"
+          # The heater follow-up reaches the node's BlueZ over the system bus, whose socket is
+          # mounted below. The default AppArmor profile of the container runtime keeps a pod off
+          # that bus even with the socket in reach, so the container runs without one.
+          securityContext:
+            appArmorProfile:
+              type: Unconfined
           volumeMounts:
             - name: tapo-config
               mountPath: /app/settings.yaml
               subPath: settings.yaml
               readOnly: true
+            - name: dbus
+              mountPath: /run/dbus
           resources:
             requests:
               cpu: "50m"
@@ -53,3 +61,11 @@ spec:
             items:
               - key: settings.yaml
                 path: settings.yaml
+        # Every node the pod can land on needs BlueZ installed and `bluetoothd` running for the
+        # follow-up to work; on one without it only the follow-up fails. That holds for a node
+        # without the directory too, which is created empty rather than keeping the pod from
+        # starting.
+        - name: dbus
+          hostPath:
+            path: /run/dbus
+            type: DirectoryOrCreate

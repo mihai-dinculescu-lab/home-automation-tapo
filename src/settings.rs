@@ -87,6 +87,48 @@ pub struct Device {
 pub struct Heater {
     pub name: String,
     pub ip_address: String,
+    /// What is done to the heater itself once its plug has been switched on. Optional.
+    pub follow_up: Option<FollowUp>,
+}
+
+impl Heater {
+    /// The follow-up when there is one and it is enabled.
+    pub fn enabled_follow_up(&self) -> Option<&FollowUp> {
+        self.follow_up
+            .as_ref()
+            .filter(|follow_up| follow_up.enabled())
+    }
+}
+
+/// What a heater needs after its plug has powered it on, for one that does not heat by itself
+/// then. `device_type` names the kind of heater, as it does the device on `PresenceSource`.
+///
+/// It never delays or changes the switching of the plug, which stays the only way a thermostat
+/// stops a heater.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "device_type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FollowUp {
+    /// A Dimplex heater of the Remo app, such as the EVO2BTA. It starts in Standby whenever it
+    /// is powered on, so it is put in Manual over Bluetooth LE.
+    DimplexRemo {
+        /// A disabled follow-up leaves the heater as its plug powers it on, and the rest of it
+        /// is kept as written.
+        enabled: bool,
+        /// The heater's Bluetooth address, e.g. `00:A0:50:41:9A:26`. The passkey it pairs with
+        /// is derived from it.
+        bluetooth_address: String,
+        /// The setpoint in °C the heater is put in Manual at. Set it above every period's
+        /// target, so that the thermostat rather than the heater decides when the room is warm.
+        temperature: u8,
+    },
+}
+
+impl FollowUp {
+    pub fn enabled(&self) -> bool {
+        match self {
+            Self::DimplexRemo { enabled, .. } => *enabled,
+        }
+    }
 }
 
 /// A part of the day in which a thermostat runs, with the rule it runs under. Outside every
@@ -409,7 +451,9 @@ impl Settings {
     /// a whole interval or more never evaluates a reading early, a zero reading age makes every
     /// reading stale and an oversized one overflows the age arithmetic, a
     /// negative deadband inverts the rules, a non-finite temperature makes every comparison
-    /// false, a duplicate key makes the coordinator skip an entry, a thermostat without a period
+    /// false, a duplicate key makes the coordinator skip an entry, a follow-up without a
+    /// Bluetooth address has no heater to reach and two with the same one would each confirm
+    /// the other's heater, a thermostat without a period
     /// would never heat, an active period that starts when it ends is either empty or the whole
     /// day, which the thermostat cannot tell apart, one shorter than the interval can pass
     /// between two ticks without either landing in it, two that overlap leave the rule for the
@@ -487,6 +531,7 @@ impl Heating {
         )?;
 
         let mut names = HashSet::new();
+        let mut bluetooth_addresses = HashSet::new();
         for thermostat in &self.thermostats {
             let name = &thermostat.name;
 
@@ -531,6 +576,32 @@ impl Heating {
                 thermostat.deadband >= 0.0,
                 "Thermostat '{name}': deadband must not be negative"
             );
+            for heater in &thermostat.heaters {
+                // Whether it is an address is left to bluer, which refuses it on every attempt.
+                if let Some(FollowUp::DimplexRemo {
+                    enabled,
+                    bluetooth_address,
+                    ..
+                }) = &heater.follow_up
+                {
+                    ensure!(
+                        !bluetooth_address.is_empty(),
+                        "Thermostat '{name}': follow_up.bluetooth_address of the heater '{}' must \
+                         not be empty",
+                        heater.name
+                    );
+                    // Only among the follow-ups that run: a heater may be listed by a second
+                    // thermostat that is switched off, as an alternative to the first. The case
+                    // is not part of an address.
+                    if thermostat.enabled && *enabled {
+                        ensure!(
+                            bluetooth_addresses.insert(bluetooth_address.to_ascii_uppercase()),
+                            "Duplicate follow_up.bluetooth_address '{bluetooth_address}' among \
+                             the enabled follow-ups of the enabled thermostats"
+                        );
+                    }
+                }
+            }
             thermostat.validate_active_periods()?;
         }
 
@@ -685,6 +756,19 @@ mod tests {
             ip_address: ip_address.to_string(),
             name: "Plug".to_string(),
             record_time_usage: false,
+        }
+    }
+
+    /// A heater with a Dimplex follow-up.
+    fn follow_up_heater(name: &str, bluetooth_address: &str, enabled: bool) -> Heater {
+        Heater {
+            name: name.to_string(),
+            ip_address: "192.168.1.115".to_string(),
+            follow_up: Some(FollowUp::DimplexRemo {
+                enabled,
+                bluetooth_address: bluetooth_address.to_string(),
+                temperature: 25,
+            }),
         }
     }
 
@@ -886,6 +970,56 @@ mod tests {
         heating(&mut settings).thermostats[0].deadband = -0.25;
 
         assert!(error(&settings).contains("deadband"));
+    }
+
+    #[test]
+    fn empty_follow_up_bluetooth_address_is_rejected_even_when_disabled() {
+        for enabled in [true, false] {
+            let mut settings = settings();
+            heating(&mut settings).thermostats[0].heaters =
+                vec![follow_up_heater("Office Heater", "", enabled)];
+
+            assert!(
+                error(&settings).contains("follow_up.bluetooth_address"),
+                "enabled {enabled}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_follow_up_bluetooth_address_is_rejected() {
+        const DUPLICATE: &str = "Duplicate follow_up.bluetooth_address";
+
+        // In one thermostat; the case of the address does not tell them apart.
+        let mut in_one = settings();
+        heating(&mut in_one).thermostats[0].heaters = vec![
+            follow_up_heater("Office Heater", "00:A0:50:41:9A:26", true),
+            follow_up_heater("Other Heater", "00:a0:50:41:9a:26", true),
+        ];
+        assert!(error(&in_one).contains(DUPLICATE));
+
+        // Across two.
+        let mut settings = settings();
+        let mut other = thermostat("Office");
+        other.heaters = vec![follow_up_heater("Other Heater", "00:A0:50:41:9A:26", true)];
+        heating(&mut settings).thermostats[0].heaters =
+            vec![follow_up_heater("Office Heater", "00:A0:50:41:9A:26", true)];
+        heating(&mut settings).thermostats.push(other);
+        assert!(error(&settings).contains(DUPLICATE));
+
+        // A second thermostat that is switched off may list the same heater, and so may a
+        // follow-up that is.
+        heating(&mut settings).thermostats[1].enabled = false;
+        settings.validate().unwrap();
+        heating(&mut settings).thermostats[1].enabled = true;
+
+        heating(&mut settings).thermostats[1].heaters[0] =
+            follow_up_heater("Other Heater", "00:A0:50:41:9A:26", false);
+        settings.validate().unwrap();
+
+        heating(&mut settings).thermostats[1].heaters[0] =
+            follow_up_heater("Other Heater", "00:A0:50:41:9A:27", true);
+        settings.validate().unwrap();
     }
 
     #[test]
@@ -1514,6 +1648,119 @@ heating:
                 && !error.contains("require_presence"),
             "unexpected error: {error}"
         );
+    }
+
+    /// A valid thermostat with one heater, whose keys after its address are `keys`: lines
+    /// indented by ten spaces, or nothing.
+    fn yaml_with_heater(keys: &str) -> String {
+        yaml_with_presence(&format!(
+            "{PRESENCE_YAML}
+      heaters:
+        - name: Office Heater
+          ip_address: 192.168.1.115
+{keys}"
+        ))
+    }
+
+    const FOLLOW_UP_YAML: &str = "          follow_up:
+            device_type: dimplex_remo
+            enabled: true
+            bluetooth_address: \"00:A0:50:41:9A:26\"
+            temperature: 25";
+
+    #[test]
+    fn heater_without_follow_up_has_none() {
+        let settings = parse(&yaml_with_heater("")).unwrap();
+        settings.validate().unwrap();
+
+        let heater = &settings.heating.unwrap().thermostats[0].heaters[0];
+        assert!(heater.follow_up.is_none());
+        assert!(heater.enabled_follow_up().is_none());
+    }
+
+    #[test]
+    fn follow_up_is_read_from_yaml() {
+        let settings = parse(&yaml_with_heater(FOLLOW_UP_YAML)).unwrap();
+        settings.validate().unwrap();
+
+        let heater = &settings.heating.unwrap().thermostats[0].heaters[0];
+        let Some(FollowUp::DimplexRemo {
+            enabled,
+            bluetooth_address,
+            temperature,
+        }) = heater.enabled_follow_up()
+        else {
+            panic!("unexpected follow-up: {:?}", heater.follow_up);
+        };
+
+        assert!(enabled);
+        assert_eq!(bluetooth_address, "00:A0:50:41:9A:26");
+        assert_eq!(*temperature, 25);
+    }
+
+    #[test]
+    fn disabled_follow_up_is_kept_but_not_enabled() {
+        let yaml = yaml_with_heater(&FOLLOW_UP_YAML.replace("enabled: true", "enabled: false"));
+
+        let settings = parse(&yaml).unwrap();
+        settings.validate().unwrap();
+
+        let heater = &settings.heating.unwrap().thermostats[0].heaters[0];
+        assert!(heater.follow_up.is_some());
+        assert!(heater.enabled_follow_up().is_none());
+    }
+
+    #[test]
+    fn follow_up_without_a_key_is_rejected() {
+        for key in ["enabled", "bluetooth_address", "temperature"] {
+            let keys: Vec<&str> = FOLLOW_UP_YAML
+                .lines()
+                .filter(|line| !line.trim_start().starts_with(key))
+                .collect();
+
+            let error = parse(&yaml_with_heater(&keys.join("\n")))
+                .expect_err("the key is required")
+                .to_string();
+            assert!(
+                error.contains("missing configuration field")
+                    && error.ends_with(&format!("{key}\"")),
+                "{key}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_key_in_follow_up_is_rejected() {
+        let yaml = yaml_with_heater(&format!("{FOLLOW_UP_YAML}\n            passkey: 379085"));
+
+        let error = parse(&yaml).expect_err("the passkey is derived");
+        assert!(
+            error.to_string().contains("unknown field"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn unknown_follow_up_device_type_is_rejected() {
+        let yaml = yaml_with_heater(&FOLLOW_UP_YAML.replace("dimplex_remo", "dimplex"));
+
+        let error = parse(&yaml).expect_err("the device type does not exist");
+        assert!(
+            error.to_string().contains("unknown variant"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn follow_up_temperature_outside_a_byte_is_rejected() {
+        // The setpoint is one byte of the frame written to the heater.
+        for temperature in ["-1", "256", "21.5"] {
+            let yaml = yaml_with_heater(
+                &FOLLOW_UP_YAML.replace("temperature: 25", &format!("temperature: {temperature}")),
+            );
+
+            assert!(parse(&yaml).is_err(), "temperature {temperature}");
+        }
     }
 
     const YAML_BASE: &str = r#"

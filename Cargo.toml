@@ -41,6 +41,10 @@ tracing-subscriber = { version = "0.3", features = [
     "std",
 ] }
 
+# BlueZ is the Bluetooth stack of Linux only, so the heater follow-up is built there alone.
+[target.'cfg(target_os = "linux")'.dependencies]
+bluer = { version = "0.17", features = ["bluetoothd"] }
+
 [dev-dependencies]
 reqwest = { version = "0.13", default-features = false, features = [
     "json",

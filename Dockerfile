@@ -8,7 +8,7 @@ FROM lukemathwalker/cargo-chef:latest-rust-1.99 AS cacher
 
 RUN apt-get update && \
     apt-get -y upgrade && \
-    apt-get -y install pkg-config libssl-dev cmake
+    apt-get -y install pkg-config libssl-dev cmake libdbus-1-dev
 
 WORKDIR /app
 RUN rustup component add rustfmt
@@ -17,6 +17,10 @@ RUN cargo chef cook --release --recipe-path recipe.json
 
 # Builder stage
 FROM rust:1.99 AS builder
+
+# libdbus is what the heater follow-up talks to the host's BlueZ through.
+RUN apt-get update && \
+    apt-get -y install pkg-config libdbus-1-dev
 
 RUN rustup component add rustfmt
 WORKDIR /app
@@ -30,7 +34,7 @@ FROM debian:trixie-slim AS runtime
 
 RUN apt-get update && \
     apt-get -y upgrade && \
-    apt-get -y install openssl ca-certificates
+    apt-get -y install openssl ca-certificates libdbus-1-3
 
 WORKDIR /app
 COPY --from=builder /app/target/release/home-automation-tapo home-automation-tapo

@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use actix::{
-    Actor, ActorContext, ActorFutureExt, AsyncContext, Context, Handler, Recipient, SpawnHandle,
-    WrapFuture,
+    Actor, ActorContext, ActorFutureExt, Addr, AsyncContext, Context, Handler, Recipient,
+    SpawnHandle, WrapFuture,
 };
 use chrono::{DateTime, Utc};
 use futures_util::future::join_all;
@@ -10,10 +11,12 @@ use tracing::{Instrument, debug, info, info_span, instrument, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::{
-    settings::{Heater, Tapo, Thermostat},
+    settings::{FollowUp, Heater, Tapo, Thermostat},
     system::devices::{DeviceSessions, DeviceType, Error as DeviceError},
+    system::dimplex::dimplex_actor::DimplexActor,
     system::messages::{
-        SensorReading, SensorReadingMessage, StopMessage, ThermostatDecisionMessage,
+        HeaterPoweredOffMessage, HeaterPoweredOnMessage, SensorReading, SensorReadingMessage,
+        StopMessage, ThermostatDecisionMessage,
     },
     system::thermostat::decision::{
         Decision, Evaluation, HeaterCommand, HeaterSwitch, Presence, Reason, SwitchOutcome, decide,
@@ -47,6 +50,10 @@ pub struct ThermostatActor {
     /// The command of the last evaluation that completed, which the deadband repeats. `None`
     /// before the first one, so that a start inside the deadband turns the heaters off.
     last_command: Option<HeaterCommand>,
+    /// The follow-up actor of each heater that has one enabled, by the heater's place in
+    /// `config.heaters`. Each is started when its plug is first switched on, and stopped with
+    /// the thermostat.
+    follow_up_actor_addrs: HashMap<usize, Addr<DimplexActor>>,
 }
 
 impl ThermostatActor {
@@ -71,6 +78,7 @@ impl ThermostatActor {
             last_tick: None,
             next_tick: None,
             last_command: None,
+            follow_up_actor_addrs: HashMap::new(),
         }
     }
 
@@ -131,6 +139,13 @@ impl ThermostatActor {
             // Remembered before the switch, which can be cancelled by the next tick.
             act.last_command = Some(evaluation.decision.command);
 
+            // Said before the switch for the same reason, and whatever the switch reports: a
+            // plug that was cut without the follow-up hearing of it would leave its heater in
+            // Standby behind a confirmation that no longer holds.
+            if evaluation.decision.command == HeaterCommand::Off {
+                switch_span.in_scope(|| act.notify_heaters_powering_off());
+            }
+
             let switch = Self::switch_heaters(
                 act.device_sessions.clone(),
                 act.config.heaters.clone(),
@@ -145,10 +160,91 @@ impl ThermostatActor {
             act.in_flight = None;
 
             let _enter = publish_span.enter();
+            if evaluation.decision.command == HeaterCommand::On {
+                act.notify_heaters_powered_on(&heaters);
+            }
             act.publish_decision(evaluation, heaters);
         });
 
         self.in_flight = Some(ctx.spawn(fut));
+    }
+
+    /// Tells every follow-up actor that its heater's plug is about to be switched off, so that
+    /// it forgets what it knew of the heater. An extra one costs a single read of the heater's
+    /// mode on the next switch on; a missing one would cost the heat.
+    fn notify_heaters_powering_off(&self) {
+        for follow_up_actor_addr in self.follow_up_actor_addrs.values() {
+            let message = HeaterPoweredOffMessage {
+                span_context: tracing::Span::current().context(),
+            };
+
+            if let Err(e) = follow_up_actor_addr.try_send(message) {
+                record_error!(&e);
+            }
+        }
+    }
+
+    /// Tells the follow-up of every heater that has one that its plug was switched on, once
+    /// the heaters have been switched. A plug that could not be switched is as it was, so
+    /// nothing is said of it.
+    ///
+    /// The follow-up runs in an actor of its own, which this thermostat starts on the first
+    /// switch on and starts again if it has died. It only begins here, outside the work a tick
+    /// can cancel, so a slow one is neither cut short by the next tick nor holds it up, and it
+    /// never delays the switching of a plug.
+    fn notify_heaters_powered_on(&mut self, heaters: &[HeaterSwitch]) {
+        // `heaters` is in the order of the settings.
+        let switches = self.config.heaters.iter().zip(heaters).enumerate();
+
+        for (index, (heater, switch)) in switches {
+            let Some(FollowUp::DimplexRemo {
+                bluetooth_address,
+                temperature,
+                ..
+            }) = heater.enabled_follow_up()
+            else {
+                continue;
+            };
+
+            if switch.outcome != SwitchOutcome::Switched {
+                continue;
+            }
+
+            let follow_up_actor_addr = self
+                .follow_up_actor_addrs
+                .entry(index)
+                .and_modify(|addr| {
+                    if !addr.connected() {
+                        warn!(
+                            "The follow-up actor of heater '{}' has stopped, restarting it",
+                            heater.name
+                        );
+                        *addr = Self::start_follow_up(heater, bluetooth_address, *temperature);
+                    }
+                })
+                .or_insert_with(|| Self::start_follow_up(heater, bluetooth_address, *temperature));
+
+            let message = HeaterPoweredOnMessage {
+                span_context: tracing::Span::current().context(),
+            };
+
+            if let Err(e) = follow_up_actor_addr.try_send(message) {
+                record_error!(&e);
+            }
+        }
+    }
+
+    fn start_follow_up(
+        heater: &Heater,
+        bluetooth_address: &str,
+        temperature: u8,
+    ) -> Addr<DimplexActor> {
+        DimplexActor::new(
+            heater.name.clone(),
+            bluetooth_address.to_string(),
+            temperature,
+        )
+        .start()
     }
 
     /// Sends the tick's decision to be published, once the heaters have been switched, so that
@@ -373,10 +469,16 @@ impl Actor for ThermostatActor {
         self.schedule_tick(ctx, Duration::ZERO, None);
     }
 
+    /// Stops the follow-up actors with the thermostat, whichever way it stopped, so that none
+    /// outlives the one that tells it of its plug. An attempt in flight is abandoned.
     #[instrument(name = "ThermostatActor::stopped", level = "error", skip_all, fields(
         thermostat.name = %self.config.name,
     ))]
-    fn stopped(&mut self, _: &mut Self::Context) {}
+    fn stopped(&mut self, _: &mut Self::Context) {
+        for (_, follow_up_actor_addr) in self.follow_up_actor_addrs.drain() {
+            follow_up_actor_addr.do_send(StopMessage);
+        }
+    }
 }
 
 impl Handler<SensorReadingMessage> for ThermostatActor {

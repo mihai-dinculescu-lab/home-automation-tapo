@@ -149,6 +149,24 @@ pub struct ThermostatDecisionMessage {
     pub heaters: Vec<HeaterSwitch>,
 }
 
+/// Sent by a thermostat to the follow-up actor of a heater whose plug its tick switched on, on
+/// every such tick and not only the first. The actor puts the heater in the state it does not
+/// start in by itself.
+#[derive(Debug, Message)]
+#[rtype(result = "()")]
+pub struct HeaterPoweredOnMessage {
+    pub span_context: opentelemetry::Context,
+}
+
+/// Sent by a thermostat to every follow-up actor when its tick decides Off, before the plugs
+/// are switched and whatever comes of the switch. The heater loses its state with its power, so
+/// the follow-up is due again on the next switch on.
+#[derive(Debug, Message)]
+#[rtype(result = "()")]
+pub struct HeaterPoweredOffMessage {
+    pub span_context: opentelemetry::Context,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ThermostatDecisionPayload {
     thermostat_name: String,

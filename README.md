@@ -15,11 +15,13 @@ Actor System consisting of:
 - MQTT Actor - publishes the device usage and the thermostat decisions to the MQTT broker (only when `device_usage` or `heating` is enabled)
 - MQTT Sensors Actor - subscribes to the sensor readings on the MQTT broker and sends each one to the Coordinator Actor, which forwards it to the thermostats of its location (only when `heating` and at least one of its thermostats are enabled)
 - Thermostat Actor - decides whether a room should be heated, switches the heater plugs and sends the decision to the Coordinator Actor, which forwards it to the MQTT Actor (only when `heating` and the thermostat are enabled)
+- Dimplex Actor - one per heater with an enabled `follow_up`, started by the heater's Thermostat Actor, puts the heater in Manual over Bluetooth LE once the thermostat has switched its plug on
 - API Actor - REST API for turning devices on/off and getting their status
 
 ## Usage
 
-Building requires [CMake](https://cmake.org/) and OpenSSL, which are needed by the MQTT client.
+Building requires [CMake](https://cmake.org/) and OpenSSL, which are needed by the MQTT client. On Linux it also
+requires libdbus (`libdbus-1-dev`), which the [heater follow-up](#heater-follow-up) reaches BlueZ through.
 
 Rename and update `settings.sample.yaml` to `settings.yaml`.
 
@@ -134,6 +136,48 @@ tick and one inside the repeated hour runs twice; keep the boundaries away from 
 `heating.thermostats` needs at least one entry. `heating.enabled: false` switches every thermostat off, and a single
 entry can be switched off with its own `enabled: false`; either leaves the heaters alone.
 
+### Heater follow-up
+
+Some heaters do not heat when their plug powers them on. A Dimplex of the Remo app, such as the EVO2BTA, starts in
+Standby every time and waits for its button or the app. A heater's optional `follow_up` block covers this: when a
+tick has switched the heater's plug on, the service connects to the heater over Bluetooth LE and puts it in Manual
+at the block's `temperature`.
+
+```yaml
+heaters:
+  - name: Office Heater
+    ip_address: 192.168.1.115
+    follow_up:
+      device_type: dimplex_remo
+      enabled: true
+      bluetooth_address: "00:A0:50:41:9A:26"
+      temperature: 25
+```
+
+- `device_type` names the kind of heater; `dimplex_remo` is the only one. `enabled: false` leaves the heater as its
+  plug powers it on and keeps the rest of the block as written.
+- `temperature` is the heater's own setpoint in °C, a whole number. The heater stops heating by itself once it
+  reads that temperature, so set it above every period's `target_temperature` for the thermostat to be the one that
+  decides.
+- The heater's mode is read first and only written when it is not already Manual at `temperature`. Once that is
+  confirmed the heater is left alone, so that the Remo app can connect to it, until the thermostat next decides to
+  switch the plug off; the next switch on confirms it again.
+- A failed attempt is recorded on its span, `DimplexActor::ensure_manual`, and made again on the next tick that
+  switches the plug on. An attempt is given 45 seconds. The heater accepts one connection at a time, so an attempt
+  fails while the Remo app holds it.
+- The follow-up never delays or changes the switching of the plug, which stays the only way the thermostat stops the
+  heater, and its outcome is not part of the published [decision](#decisions).
+- A plug cut by anything but the thermostat, such as a mains blip or a switch by hand, leaves the heater in Standby
+  while it still counts as confirmed, until the thermostat next switches the plug off and on.
+- No passkey is configured: the one the heater pairs with is derived from its address, and the host pairs by itself
+  on the first attempt. Two enabled follow-ups of enabled thermostats with the same `bluetooth_address` are rejected
+  at startup.
+
+This needs BlueZ, so it only works on Linux; elsewhere every attempt fails. The service talks to the host's
+`bluetoothd` over the system D-Bus: the host needs BlueZ installed (`apt install bluez`) and its adapter powered,
+and a container needs the host's `/run/dbus` mounted and, where the container runtime's AppArmor profile keeps it
+off the bus, to run without that profile, as `kubernetes/deployment.yaml` does.
+
 ### Decisions
 
 Every tick publishes its decision on `heating.decisions_publish_topic` once it has switched the heaters, one message per
@@ -238,6 +282,7 @@ Extra resource attributes can be set through `OTEL_RESOURCE_ATTRIBUTES`, e.g. `s
 
 The image does not include a usable `settings.yaml`, so one has to be mounted at `/app/settings.yaml`.
 The published port has to match the `api.port` from `settings.yaml`.
+A [heater follow-up](#heater-follow-up) also needs the host's `/run/dbus` mounted (`-v /run/dbus:/run/dbus`).
 
 A prebuilt image is published to the GitHub Container Registry.
 
@@ -254,7 +299,9 @@ docker run -d -p 80:80 -v ./settings.yaml:/app/settings.yaml home-automation-tap
 
 ## Kubernetes
 
-The manifests in `kubernetes/` are applied by CI on every push to `main`.
+The manifests in `kubernetes/` are applied by CI on every push to `main`. The deployment mounts the node's
+`/run/dbus` and runs the container without an AppArmor profile, both for the [heater follow-up](#heater-follow-up),
+which also needs BlueZ installed on every node the pod can land on.
 
 ```bash
 kubectl apply -k kubernetes/

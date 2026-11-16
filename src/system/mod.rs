@@ -2,6 +2,7 @@ pub mod api;
 pub mod coordinator_actor;
 mod device_usage_actor;
 pub mod devices;
+pub mod dimplex;
 mod messages;
 mod mqtt_actor;
 mod mqtt_sensors_actor;

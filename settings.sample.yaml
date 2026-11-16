@@ -77,6 +77,21 @@ heating:
       heaters:
         - name:
           ip_address:
+          # optional; delete this block for a heater that heats as soon as its plug powers it.
+          # What is done to the heater itself once its plug has been switched on
+          follow_up:
+            # the kind of heater: dimplex_remo (a Dimplex of the Remo app, such as the EVO2BTA,
+            # which starts in Standby and is put in Manual over Bluetooth LE)
+            device_type:
+            # a disabled follow-up leaves the heater as its plug powers it on, and the rest of
+            # it is kept as written
+            enabled:
+            # the heater's Bluetooth address in quotes, e.g. "00:A0:50:41:9A:26"; no two
+            # enabled follow-ups of enabled thermostats may share one
+            bluetooth_address:
+            # the setpoint in °C the heater is put in Manual at, a whole number; set it above
+            # every period's target, so that the thermostat decides when the room is warm
+            temperature:
       # half-width of the band around the target in which the last command is repeated
       deadband:
       # a reading older than this many seconds is treated as missing, at most 86400 (24 hours)
