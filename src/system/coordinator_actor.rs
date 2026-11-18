@@ -464,7 +464,7 @@ impl Handler<ThermostatDecisionMessage> for CoordinatorActor {
 impl Handler<SensorReadingMessage> for CoordinatorActor {
     type Result = ();
 
-    /// Forwarded to every thermostat whose `sensor_location` is the reading's, so that a
+    /// Forwarded to every thermostat whose `sensor.location` is the reading's, so that a
     /// restarted thermostat is picked up without re-wiring the sensors actor.
     fn handle(&mut self, message: SensorReadingMessage, _: &mut Context<Self>) -> Self::Result {
         let span = consumer_span!(
@@ -482,7 +482,7 @@ impl Handler<SensorReadingMessage> for CoordinatorActor {
 
         let thermostat_actor_addrs = heating
             .enabled_thermostats()
-            .filter(|thermostat| thermostat.sensor_location == message.reading.location)
+            .filter(|thermostat| thermostat.sensor.location == message.reading.location)
             .filter_map(|thermostat| self.thermostat_actor_addrs.get(&thermostat.name));
 
         for thermostat_actor_addr in thermostat_actor_addrs {

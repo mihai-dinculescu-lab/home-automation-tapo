@@ -35,7 +35,7 @@ impl SensorReading {
 }
 
 /// Sent by the sensors actor for every reading it receives, and forwarded by the coordinator to
-/// the thermostats whose `sensor_location` is the reading's, each of which keeps it and ticks on
+/// the thermostats whose `sensor.location` is the reading's, each of which keeps it and ticks on
 /// it.
 #[derive(Debug, Message)]
 #[rtype(result = "()")]

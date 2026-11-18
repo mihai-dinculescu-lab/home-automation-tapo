@@ -325,9 +325,20 @@ impl PresenceSource {
     }
 }
 
+/// The temperature sensor a thermostat reads.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Sensor {
+    /// Matches the `location` field of the sensor payload.
+    pub location: String,
+    /// A reading older than this many seconds is treated as missing.
+    pub reading_max_age_s: u64,
+}
+
 /// Unknown keys are rejected so that a settings file in the shape of an earlier release, which
 /// kept `active_period` and `target_temperature` here, and later `camera_ip_address` and
-/// `presence_window_s`, fails at startup instead of being read with those silently ignored.
+/// `presence_window_s`, and then `sensor_location` and `reading_max_age_s`, fails at startup
+/// instead of being read with those silently ignored.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Thermostat {
@@ -342,15 +353,13 @@ pub struct Thermostat {
     pub active_periods: Vec<ActivePeriod>,
     /// The device that decides presence. Required even when no period requires presence.
     pub presence: PresenceSource,
-    /// Matches the `location` field of the sensor payload.
-    pub sensor_location: String,
+    /// The temperature sensor whose readings are evaluated.
+    pub sensor: Sensor,
     /// Plugs switched together. Optional; without any, the decision is only logged and published.
     #[serde(default)]
     pub heaters: Vec<Heater>,
     /// Half-width of the band around the target in which the last command is repeated.
     pub deadband: f64,
-    /// A reading older than this many seconds is treated as missing.
-    pub reading_max_age_s: u64,
     /// The longest time between two evaluations, the one used when no reading arrives.
     pub interval_s: u64,
     /// The shortest time between two evaluations. Every reading is evaluated as it arrives, or
@@ -560,13 +569,13 @@ impl Heating {
                  (24 hours), the longest window a camera accepts, kept for every presence source"
             );
             ensure!(
-                thermostat.reading_max_age_s > 0,
-                "Thermostat '{name}': reading_max_age_s must be greater than 0"
+                thermostat.sensor.reading_max_age_s > 0,
+                "Thermostat '{name}': sensor.reading_max_age_s must be greater than 0"
             );
             ensure!(
-                thermostat.reading_max_age_s <= MAX_READING_MAX_AGE_S,
-                "Thermostat '{name}': reading_max_age_s must be at most {MAX_READING_MAX_AGE_S} \
-                 (24 hours)"
+                thermostat.sensor.reading_max_age_s <= MAX_READING_MAX_AGE_S,
+                "Thermostat '{name}': sensor.reading_max_age_s must be at most \
+                 {MAX_READING_MAX_AGE_S} (24 hours)"
             );
             ensure!(
                 thermostat.deadband.is_finite(),
@@ -706,10 +715,12 @@ mod tests {
             time_zone: chrono_tz::Europe::London,
             active_periods: vec![period("08:00", "22:00")],
             presence: camera(900),
-            sensor_location: "Living Room".to_string(),
+            sensor: Sensor {
+                location: "Living Room".to_string(),
+                reading_max_age_s: 900,
+            },
             heaters: vec![],
             deadband: 0.25,
-            reading_max_age_s: 900,
             interval_s: 300,
             min_interval_s: 60,
         }
@@ -919,19 +930,23 @@ mod tests {
     #[test]
     fn zero_reading_max_age_is_rejected() {
         let mut settings = settings();
-        heating(&mut settings).thermostats[0].reading_max_age_s = 0;
+        heating(&mut settings).thermostats[0]
+            .sensor
+            .reading_max_age_s = 0;
 
-        assert!(error(&settings).contains("reading_max_age_s must be greater than 0"));
+        assert!(error(&settings).contains("sensor.reading_max_age_s must be greater than 0"));
     }
 
     #[test]
     fn reading_max_age_over_a_day_is_rejected() {
         for reading_max_age_s in [MAX_READING_MAX_AGE_S + 1, u64::MAX] {
             let mut settings = settings();
-            heating(&mut settings).thermostats[0].reading_max_age_s = reading_max_age_s;
+            heating(&mut settings).thermostats[0]
+                .sensor
+                .reading_max_age_s = reading_max_age_s;
 
             assert!(
-                error(&settings).contains("reading_max_age_s must be at most"),
+                error(&settings).contains("sensor.reading_max_age_s must be at most"),
                 "reading_max_age_s {reading_max_age_s}"
             );
         }
@@ -1315,9 +1330,10 @@ heating:
           target_temperature: 22.0
           require_presence: true
 {PRESENCE_YAML}
-      sensor_location: Living Room
+      sensor:
+        location: Living Room
+        reading_max_age_s: 900
       deadband: 0.25
-      reading_max_age_s: 900
       interval_s: 300
       min_interval_s: 60
 "
@@ -1356,9 +1372,10 @@ heating:
           end: \"22:00\"
           target_temperature: 22.0
 {PRESENCE_YAML}
-      sensor_location: Living Room
+      sensor:
+        location: Living Room
+        reading_max_age_s: 900
       deadband: 0.25
-      reading_max_age_s: 900
       interval_s: 300
       min_interval_s: 60
 "
@@ -1386,9 +1403,10 @@ heating:
           require_presence: true
           deadband: 0.5
 {PRESENCE_YAML}
-      sensor_location: Living Room
+      sensor:
+        location: Living Room
+        reading_max_age_s: 900
       deadband: 0.25
-      reading_max_age_s: 900
       interval_s: 300
       min_interval_s: 60
 "
@@ -1421,10 +1439,11 @@ heating:
         end: \"22:00\"
         time_zone: Europe/London
 {PRESENCE_YAML}
-      sensor_location: Living Room
+      sensor:
+        location: Living Room
+        reading_max_age_s: 900
       target_temperature: 22.0
       deadband: 0.25
-      reading_max_age_s: 900
       interval_s: 300
       min_interval_s: 60
 "
@@ -1452,9 +1471,10 @@ heating:
           target_temperature: 22.0
           require_presence: true
 {keys}
-      sensor_location: Living Room
+      sensor:
+        location: Living Room
+        reading_max_age_s: 900
       deadband: 0.25
-      reading_max_age_s: 900
       interval_s: 300
       min_interval_s: 60
 "

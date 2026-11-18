@@ -71,18 +71,18 @@ by requests with the same `device_type`, so a device that the service also polls
 
 While `heating` and at least one of its thermostats are enabled, the service subscribes to the MQTT topic filter
 `heating.sensors_subscribe_topic` (e.g. `sensors/#`) and sends every reading, from JSON payloads with at least
-`{"location": "Living Room", "temperature": 21.4}`, to the thermostats whose `sensor_location` is its `location`, each
+`{"location": "Living Room", "temperature": 21.4}`, to the thermostats whose `sensor.location` is its `location`, each
 of which keeps the latest one. The messages are not retained, so readings are only known from the moment the service
 subscribes, and a thermostat that is restarted has none until the next one arrives.
 
 ## Thermostat
 
-Each enabled entry in `heating.thermostats` is evaluated on every reading for its `sensor_location`, and every
+Each enabled entry in `heating.thermostats` is evaluated on every reading for its `sensor.location`, and every
 `interval_s` seconds while none arrives, under the rule of the active period containing the current time. The heaters
 are turned **on** when the presence source detected someone in the last `presence.window_s` seconds and the latest
-sensor reading for `sensor_location` is under the period's `target_temperature - deadband`. They are turned **off**
+sensor reading for `sensor.location` is under the period's `target_temperature - deadband`. They are turned **off**
 when nobody was detected, the presence source cannot be queried, the reading is missing or older than
-`reading_max_age_s` seconds, or the temperature is above `target_temperature + deadband`. In between, the last
+`sensor.reading_max_age_s` seconds, or the temperature is above `target_temperature + deadband`. In between, the last
 command is repeated, so that they do not cycle around the setpoint; right after a start there is no last command and
 they are turned off. A period with `require_presence: false` skips the presence source and heats the room on the
 reading alone, e.g. before anyone is up.
@@ -90,7 +90,7 @@ reading alone, e.g. before anyone is up.
 The ticks follow the sensor rather than a clock of their own: every reading starts a tick, so it is evaluated as it
 arrives, and every tick schedules the next one `interval_s` on in case no reading comes first. A sensor that falls
 silent leaves the ticks to the interval, which switch the heaters off once its reading is older than
-`reading_max_age_s`. A reading that arrives within `min_interval_s` of the last tick is evaluated once that has
+`sensor.reading_max_age_s`. A reading that arrives within `min_interval_s` of the last tick is evaluated once that has
 passed, so that the tick is not repeated on nearly the same inputs and a slow plug is not cancelled mid-switch.
 `min_interval_s` has to be at least 60, about the longest a tick with a slow plug takes, and less than `interval_s`.
 
@@ -100,7 +100,7 @@ shutdown: the next start asserts the heaters on its first tick.
 The readings are not retained, so none is known right after a start and the heaters are turned off until the first
 one arrives. This also covers plugs left on by a run that crashed.
 
-The readings are the ones sent by the [Sensors](#sensors) subscription, matched on `sensor_location`.
+The readings are the ones sent by the [Sensors](#sensors) subscription, matched on `sensor.location`.
 
 `presence` names the device that decides presence. Its `device_type` is the Tapo handler the device is reached
 through: `camera` for the C120, `camera_ptz` for the C210, C220, C225, C325WB, C520WS, TC40 and TC70, and `t100` for
@@ -207,7 +207,7 @@ stopped thermostat or an undeliverable command is built on.
   outside every period, and so is every input, since nothing is queried there.
 - `presence_detected` is `null` when the period does not require presence or the presence source could not be
   queried, which is the reason `presence_error`. From a T100 it means motion, not necessarily a person.
-- `temperature` and `reading_age_s` are `null` when there is no reading for `sensor_location`.
+- `temperature` and `reading_age_s` are `null` when there is no reading for `sensor.location`.
 - `heaters` lists every heater in the order of the settings with the `outcome` of its switch: `switched`, `failed`, or
   `shutting_down` when the service was stopping and the command was not sent.
 
@@ -243,12 +243,12 @@ fully met yet and are marked as such.
    fresh reading below the band, and presence detected in any period that requires it. A period with
    `require_presence: false` is an explicit, logged opt-out, so property 12 still holds.
 6. **Exposure is bounded once a trigger disappears.** After a person leaves or a sensor falls silent, the heaters are
-   off within `presence.window_s` or `reading_max_age_s` plus one interval. A T100 is held to the same window: only
-   its timed trigger log is read, never its `detected` flag, which a sensor that died could leave set. A hub whose
+   off within `presence.window_s` or `sensor.reading_max_age_s` plus one interval. A T100 is held to the same window:
+   only its timed trigger log is read, never its `detected` flag, which a sensor that died could leave set. A hub whose
    clock runs ahead adds the difference to the bound. Periods that do not require presence
    are not bounded by the presence window: the heaters can run on the reading alone until the next period that
    requires presence or the next gap, plus one interval. A schedule in which no period requires presence is bounded
-   by `reading_max_age_s` only.
+   by `sensor.reading_max_age_s` only.
 7. **No heater stays on without a fresh On, even with the service gone.** Not met yet. Every safeguard above runs in
    the service, so a pod that is gone, cut off from the network or unable to reach a plug leaves the plug as it was.
    The plug's own countdown timer, armed on every On, would close this.

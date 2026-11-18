@@ -71,8 +71,12 @@ heating:
         # (24 hours); a t100 detects motion rather than people, so it needs a longer window
         # than a camera
         window_s:
-      # matches the `location` field of the sensor payload
-      sensor_location:
+      # the temperature sensor whose readings are evaluated
+      sensor:
+        # matches the `location` field of the sensor payload
+        location:
+        # a reading older than this many seconds is treated as missing, at most 86400 (24 hours)
+        reading_max_age_s:
       # P110 plugs switched together
       heaters:
         - name:
@@ -94,8 +98,6 @@ heating:
             temperature:
       # half-width of the band around the target in which the last command is repeated
       deadband:
-      # a reading older than this many seconds is treated as missing, at most 86400 (24 hours)
-      reading_max_age_s:
       # the longest time between two evaluations, in seconds, the one used when no sensor reading arrives
       interval_s:
       # the shortest time between two evaluations, in seconds: every sensor reading is evaluated

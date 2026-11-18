@@ -125,7 +125,7 @@ pub fn decide(
         }
     }
 
-    let max_age = Duration::seconds(config.reading_max_age_s as i64);
+    let max_age = Duration::seconds(config.sensor.reading_max_age_s as i64);
 
     let Some(reading) = reading else {
         return Decision::new(HeaterCommand::Off, Reason::NoReading);
@@ -152,7 +152,7 @@ mod tests {
     use chrono::TimeZone;
 
     use super::*;
-    use crate::settings::{ActivePeriod, PresenceSource};
+    use crate::settings::{ActivePeriod, PresenceSource, Sensor};
 
     fn period(start: &str, end: &str, target_temperature: f64) -> ActivePeriod {
         ActivePeriod::new(start, end, target_temperature, true)
@@ -170,10 +170,12 @@ mod tests {
                 name: "Living Room Camera".to_string(),
                 window_s: 900,
             },
-            sensor_location: "Living Room".to_string(),
+            sensor: Sensor {
+                location: "Living Room".to_string(),
+                reading_max_age_s: 900,
+            },
             heaters: vec![],
             deadband: 0.25,
-            reading_max_age_s: 900,
             interval_s: 300,
             min_interval_s: 60,
         }

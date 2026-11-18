@@ -38,7 +38,7 @@ pub struct ThermostatActor {
     /// is not reached through `device_sessions`.
     tapo: Tapo,
     config: Thermostat,
-    /// The latest reading for `sensor_location`. `None` until the first one arrives, since the
+    /// The latest reading for `sensor.location`. `None` until the first one arrives, since the
     /// readings are not retained.
     reading: Option<SensorReading>,
     /// The tick's work in flight, if any: the evaluation and the switch that follows it. The
